@@ -101,41 +101,34 @@ class IAlarm:
         self._close_connection()
         raise ConnectionError(msg)
 
-    async def _receive(self, retries: int = 3, initial_delay: float = 0.5):
-        """Receive and decode the message, with retry logic."""
+    async def _receive(self):
+        """Receive and decode the message without retry logic."""
 
-        delay = initial_delay
-        for attempt in range(retries):
-            await self.ensure_connection_is_open()
-            loop = asyncio.get_running_loop()
-            try:
-                buffer = await self._receive_data(loop)
-                decoded = self._decode_message(buffer)
+        await self.ensure_connection_is_open()
+        loop = asyncio.get_running_loop()
 
-                if not decoded:
-                    self.__raise_connection_error(
-                        "Connection error, received an unexpected reply"
-                    )
+        try:
+            buffer = await self._receive_data(loop)
+            decoded = self._decode_message(buffer)
 
-                return await self._parse_decoded_message(decoded)
+            if not decoded:
+                self.__raise_connection_error(
+                    "Connection error, received an unexpected reply"
+                )
 
-            except OSError as e:
-                self._close_connection()
-                log.error("OSError occurred: %s", e)
-                if e.errno == 9:
-                    log.error("Bad file descriptor. Stopping retries.")
-                    raise
+            return await self._parse_decoded_message(decoded)
 
-            except Exception as e:
-                self._close_connection()
-                log.error("Attempt %d failed: %s", attempt + 1, e)
-                if attempt < retries - 1:
-                    log.warning("Retrying in %d seconds...", delay)
-                    await asyncio.sleep(delay)
-                    delay *= 2  # Exponential backoff
-                else:
-                    log.error("Max retries reached. Raising the exception.")
-                    raise
+        except OSError as e:
+            self._close_connection()
+            log.error("OSError occurred: %s", e)
+            if e.errno == 9:
+                log.error("Bad file descriptor.")
+                raise
+
+        except Exception as e:
+            self._close_connection()
+            log.error("An error occurred: %s", e)
+            raise
 
     async def _receive_data(self, loop):
         """Receives data from the socket asynchronously."""
