@@ -103,14 +103,11 @@ class IAlarm:
     async def _receive(self, retries: int = 3, initial_delay: float = 0.5):
         """Receive and decode the message, with retry logic."""
 
-        if not self._is_socket_open():
-            self.__raise_connection_error("Socket is not open")
-
         delay = initial_delay
         for attempt in range(retries):
+            await self.ensure_connection_is_open()
+            loop = asyncio.get_running_loop()
             try:
-                loop = asyncio.get_running_loop()
-
                 buffer = await self._receive_data(loop)
                 decoded = self._decode_message(buffer)
 
@@ -142,12 +139,12 @@ class IAlarm:
     async def _receive_data(self, loop):
         """Receives data from the socket asynchronously."""
         buffer = b""
-        self.sock.setblocking(False)
 
         while True:
             if not self._is_socket_open():
                 self.raise_connection_error("Socket is not open")
 
+            self.sock.setblocking(False)
             chunk = await loop.sock_recv(self.sock, 4096)
             if not chunk:
                 self.raise_connection_error("Connection error, received no reply")
