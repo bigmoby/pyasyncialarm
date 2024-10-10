@@ -72,7 +72,31 @@ class IAlarm:
         if self.sock and self.sock.fileno() != -1:
             self.sock.close()
 
-    async def _receive(self):
+    def _is_complete_message(self, buffer: bytes) -> bool:
+        """Check if the buffer contains a complete message based on the delimiters."""
+
+        start_delimiter_type_standard = b"@ieM"
+        start_delimiter_type_list_2 = b"@ieM02"
+        start_delimiter_type_list_3 = b"@ieM03"
+        start_delimiter_type_list_4 = b"@ieM04"
+        end_delimiter = b"0001"
+
+        if buffer.startswith(start_delimiter_type_standard):
+            if buffer.startswith(
+                (
+                    start_delimiter_type_list_2,
+                    start_delimiter_type_list_3,
+                    start_delimiter_type_list_4,
+                )
+            ):
+                return bool(len(buffer) >= 4 and buffer[-4:].isdigit())
+
+            # Se inizia con '@ieM', controlla solo l'end_delimiter
+            return buffer.endswith(end_delimiter)
+
+        return False
+
+    async def _receive(self, retries: int = 3, initial_delay: float = 0.5):
         def raise_connection_error(msg: str):
             self._close_connection()
             raise ConnectionError(msg)
@@ -80,34 +104,55 @@ class IAlarm:
         if not self._is_socket_open():
             raise_connection_error("Socket is not open")
 
-        try:
-            self.sock.setblocking(False)
-            loop = asyncio.get_running_loop()
-            data = await loop.sock_recv(self.sock, 1024)
+        delay = initial_delay
+        for attempt in range(retries):
+            try:
+                self.sock.setblocking(False)
+                loop = asyncio.get_running_loop()
 
-            if not data:
-                raise_connection_error("Connection error, received no reply")
+                buffer = b""
+                while True:
+                    chunk = await loop.sock_recv(self.sock, 4096)
+                    if not chunk:
+                        raise_connection_error("Connection error, received no reply")
+                    buffer += chunk
 
-        except Exception:
-            self._close_connection()
-            raise
+                    if self._is_complete_message(buffer):
+                        break
 
-        payload = data[16:-4]
-        decoded = (
-            self._xor(payload).decode(errors="ignore").replace("<Err>ERR|00</Err>", "")
-        )
+                payload = buffer[16:-4]
 
-        log.debug("Decoded data: %s", decoded)
+                decoded = (
+                    self._xor(payload)
+                    .decode(errors="ignore")
+                    .replace("<Err>ERR|00</Err>", "")
+                )
 
-        if not decoded:
-            raise_connection_error("Connection error, received an unexpected reply")
+                log.debug("Decoded data: %s", decoded)
 
-        return xmltodict.parse(
-            decoded,
-            xml_attribs=False,
-            dict_constructor=dict,
-            postprocessor=self._xmlread,
-        )
+                if not decoded:
+                    raise_connection_error(
+                        "Connection error, received an unexpected reply"
+                    )
+
+                return await asyncio.to_thread(
+                    xmltodict.parse,
+                    decoded,
+                    xml_attribs=False,
+                    dict_constructor=dict,
+                    postprocessor=self._xmlread,
+                )
+
+            except Exception as e:
+                self._close_connection()
+                log.error("Attempt %d failed: %s", attempt + 1, e)
+                if attempt < retries - 1:
+                    log.warning("Retrying in %d seconds...", delay)
+                    await asyncio.sleep(delay)
+                    delay *= 2  # Exponential backoff
+                else:
+                    log.error("Max retries reached. Raising the exception.")
+                    raise
 
     async def _send_request_list(
         self,

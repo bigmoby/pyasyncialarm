@@ -50,7 +50,7 @@ async def test_receive(ialarm):
         with patch("asyncio.get_running_loop") as mock_event_loop:
             mock_event_loop_instance = mock_event_loop.return_value
             mock_event_loop_instance.sock_recv = AsyncMock(
-                return_value=b"@ieM00020000<Root><Data>Mocked XML Data</Data></Root>"
+                return_value=b"@ieM00020000<Root><Data>Mocked XML Data</Data></Root>0001"
             )
 
             with patch.object(
