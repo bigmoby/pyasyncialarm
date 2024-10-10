@@ -4,6 +4,7 @@ import logging
 import re
 import socket
 from typing import Any, Optional
+import xml.parsers.expat
 
 import dicttoxml2
 import xmltodict
@@ -142,12 +143,12 @@ class IAlarm:
 
         while True:
             if not self._is_socket_open():
-                self.raise_connection_error("Socket is not open")
+                self.__raise_connection_error("Socket is not open")
 
             self.sock.setblocking(False)
             chunk = await loop.sock_recv(self.sock, 4096)
             if not chunk:
-                self.raise_connection_error("Connection error, received no reply")
+                self.__raise_connection_error("Connection error, received no reply")
 
             buffer += chunk
 
@@ -163,18 +164,22 @@ class IAlarm:
             self._xor(payload).decode(errors="ignore").replace("<Err>ERR|00</Err>", "")
         )
 
-        log.debug("Decoded data: %s", decoded)
+        log.debug("Raw decoded data: %s", decoded)
         return decoded
 
     async def _parse_decoded_message(self, decoded):
         """Parse the decoded message using xmltodict in a separate thread."""
-        return await asyncio.to_thread(
-            xmltodict.parse,
-            decoded,
-            xml_attribs=False,
-            dict_constructor=dict,
-            postprocessor=self._xmlread,
-        )
+        try:
+            return await asyncio.to_thread(
+                xmltodict.parse,
+                decoded,
+                xml_attribs=False,
+                dict_constructor=dict,
+                postprocessor=self._xmlread,
+            )
+        except xml.parsers.expat.ExpatError as e:
+            log.error("XML Parsing error: %s", e)
+            self.__raise_connection_error("Received malformed XML response")
 
     async def _send_request_list(
         self,
