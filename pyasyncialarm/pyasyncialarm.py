@@ -96,52 +96,37 @@ class IAlarm:
 
         return False
 
+    def __raise_connection_error(self, msg: str):
+        self._close_connection()
+        raise ConnectionError(msg)
+
     async def _receive(self, retries: int = 3, initial_delay: float = 0.5):
-        def raise_connection_error(msg: str):
-            self._close_connection()
-            raise ConnectionError(msg)
+        """Receive and decode the message, with retry logic."""
 
         if not self._is_socket_open():
-            raise_connection_error("Socket is not open")
+            self.__raise_connection_error("Socket is not open")
 
         delay = initial_delay
         for attempt in range(retries):
             try:
-                self.sock.setblocking(False)
                 loop = asyncio.get_running_loop()
 
-                buffer = b""
-                while True:
-                    chunk = await loop.sock_recv(self.sock, 4096)
-                    if not chunk:
-                        raise_connection_error("Connection error, received no reply")
-                    buffer += chunk
-
-                    if self._is_complete_message(buffer):
-                        break
-
-                payload = buffer[16:-4]
-
-                decoded = (
-                    self._xor(payload)
-                    .decode(errors="ignore")
-                    .replace("<Err>ERR|00</Err>", "")
-                )
-
-                log.debug("Decoded data: %s", decoded)
+                buffer = await self._receive_data(loop)
+                decoded = self._decode_message(buffer)
 
                 if not decoded:
-                    raise_connection_error(
+                    self.__raise_connection_error(
                         "Connection error, received an unexpected reply"
                     )
 
-                return await asyncio.to_thread(
-                    xmltodict.parse,
-                    decoded,
-                    xml_attribs=False,
-                    dict_constructor=dict,
-                    postprocessor=self._xmlread,
-                )
+                return await self._parse_decoded_message(decoded)
+
+            except OSError as e:
+                self._close_connection()
+                log.error("OSError occurred: %s", e)
+                if e.errno == 9:
+                    log.error("Bad file descriptor. Stopping retries.")
+                    raise
 
             except Exception as e:
                 self._close_connection()
@@ -153,6 +138,46 @@ class IAlarm:
                 else:
                     log.error("Max retries reached. Raising the exception.")
                     raise
+
+    async def _receive_data(self, loop):
+        """Receives data from the socket asynchronously."""
+        buffer = b""
+        self.sock.setblocking(False)
+
+        while True:
+            if not self._is_socket_open():
+                self.raise_connection_error("Socket is not open")
+
+            chunk = await loop.sock_recv(self.sock, 4096)
+            if not chunk:
+                self.raise_connection_error("Connection error, received no reply")
+
+            buffer += chunk
+
+            if self._is_complete_message(buffer):
+                break
+
+        return buffer
+
+    def _decode_message(self, buffer):
+        """Decode the message by extracting the payload and applying the XOR operation."""
+        payload = buffer[16:-4]
+        decoded = (
+            self._xor(payload).decode(errors="ignore").replace("<Err>ERR|00</Err>", "")
+        )
+
+        log.debug("Decoded data: %s", decoded)
+        return decoded
+
+    async def _parse_decoded_message(self, decoded):
+        """Parse the decoded message using xmltodict in a separate thread."""
+        return await asyncio.to_thread(
+            xmltodict.parse,
+            decoded,
+            xml_attribs=False,
+            dict_constructor=dict,
+            postprocessor=self._xmlread,
+        )
 
     async def _send_request_list(
         self,
