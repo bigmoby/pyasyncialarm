@@ -56,7 +56,6 @@ class IAlarm:
     async def ensure_connection_is_open(self) -> None:
         if not self._is_socket_open():
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.setblocking(False)
             self.sock.settimeout(SOCKET_TIMEOUT)
 
             self.seq = 0
