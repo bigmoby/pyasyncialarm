@@ -166,3 +166,7 @@ class ZoneTypeRaw(TypedDict):
     Voice: int
     Name: str
     Bell: str
+
+
+RECV_BUF_SIZE = 1024
+SOCKET_TIMEOUT = 10.0

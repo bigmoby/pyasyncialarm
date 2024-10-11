@@ -12,6 +12,8 @@ import xmltodict
 from pyasyncialarm.const import (
     ALARM_TYPE_MAP,
     EVENT_TYPE_MAP,
+    RECV_BUF_SIZE,
+    SOCKET_TIMEOUT,
     ZONE_TYPE_MAP,
     LogEntryType,
     LogEntryTypeRaw,
@@ -55,6 +57,7 @@ class IAlarm:
         if not self._is_socket_open():
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.setblocking(False)
+            self.sock.settimeout(SOCKET_TIMEOUT)
 
             self.seq = 0
             loop = asyncio.get_running_loop()
@@ -102,63 +105,55 @@ class IAlarm:
         raise ConnectionError(msg)
 
     async def _receive(self):
-        """Receive and decode the message without retry logic."""
+        """Receive and decode the message from the socket."""
 
-        await self.ensure_connection_is_open()
-        loop = asyncio.get_running_loop()
+        def raise_connection_error(msg: str):
+            """Chiude la connessione e solleva un'eccezione di connessione."""
+            self._close_connection()
+            raise ConnectionError(msg)
 
         try:
-            buffer = await self._receive_data(loop)
-            decoded = self._decode_message(buffer)
+            buffer = b""
+            await self.ensure_connection_is_open()
+            log.debug("Attempting to receive data from the socket...")
+            loop = asyncio.get_running_loop()
+            buffer = await asyncio.wait_for(
+                loop.sock_recv(self.sock, RECV_BUF_SIZE), timeout=SOCKET_TIMEOUT
+            )
+
+            if not buffer:
+                raise_connection_error("Connection error: received no data.")
+
+            log.debug("Received buffer of size %d", len(buffer))
+
+            if not self._is_complete_message(buffer):
+                raise_connection_error("Connection error: incomplete message received.")
+
+            log.debug("Extracting payload from buffer of size %d", len(buffer))
+            payload = buffer[16:-4]
+
+            decoded = (
+                self._xor(payload)
+                .decode(errors="ignore")
+                .replace("<Err>ERR|00</Err>", "")
+            )
+
+            log.debug("Decoded message: %s", decoded)
 
             if not decoded:
-                self.__raise_connection_error(
-                    "Connection error, received an unexpected reply"
-                )
+                raise_connection_error("Connection error: unexpected empty reply.")
 
             return await self._parse_decoded_message(decoded)
 
         except OSError as e:
             self._close_connection()
             log.error("OSError occurred: %s", e)
-            if e.errno == 9:
-                log.error("Bad file descriptor.")
-                raise
+            raise
 
         except Exception as e:
             self._close_connection()
-            log.error("An error occurred: %s", e)
+            log.error("Exception occurred: %s", e)
             raise
-
-    async def _receive_data(self, loop):
-        """Receives data from the socket asynchronously."""
-        buffer = b""
-
-        while True:
-            if not self._is_socket_open():
-                self.__raise_connection_error("Socket is not open")
-
-            self.sock.setblocking(False)
-            chunk = await loop.sock_recv(self.sock, 4096)
-            if not chunk:
-                self.__raise_connection_error("Connection error, received no reply")
-
-            buffer += chunk
-
-            if self._is_complete_message(buffer):
-                break
-
-        return buffer
-
-    def _decode_message(self, buffer):
-        """Decode the message by extracting the payload and applying the XOR operation."""
-        payload = buffer[16:-4]
-        decoded = (
-            self._xor(payload).decode(errors="ignore").replace("<Err>ERR|00</Err>", "")
-        )
-
-        log.debug("Raw decoded data: %s", decoded)
-        return decoded
 
     async def _parse_decoded_message(self, decoded):
         """Parse the decoded message using xmltodict in a separate thread."""
