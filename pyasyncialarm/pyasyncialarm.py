@@ -83,24 +83,31 @@ class IAlarm:
     def _is_complete_message(self, buffer: bytes) -> bool:
         """Check if the buffer contains a complete message based on the delimiters."""
 
-        start_delimiter_type_standard = b"@ieM"
+        start_delimiter_type_standard = b"@ieM01"
         start_delimiter_type_list_2 = b"@ieM02"
         start_delimiter_type_list_3 = b"@ieM03"
         start_delimiter_type_list_4 = b"@ieM04"
         end_delimiter = b"0001"
+        end_delimiter_alarm_status_stay = b"0025"
+        end_delimiter_alarm_status_armed = b"0049"
 
         if buffer.startswith(start_delimiter_type_standard):
-            if buffer.startswith(
+            return buffer.endswith(
                 (
-                    start_delimiter_type_list_2,
-                    start_delimiter_type_list_3,
-                    start_delimiter_type_list_4,
+                    end_delimiter,
+                    end_delimiter_alarm_status_stay,
+                    end_delimiter_alarm_status_armed,
                 )
-            ):
-                return bool(len(buffer) >= 4 and buffer[-4:].isdigit())
+            )
 
-            # Se inizia con '@ieM', controlla solo l'end_delimiter
-            return buffer.endswith(end_delimiter)
+        if buffer.startswith(
+            (
+                start_delimiter_type_list_2,
+                start_delimiter_type_list_3,
+                start_delimiter_type_list_4,
+            )
+        ):
+            return bool(len(buffer) >= 4 and buffer[-4:].isdigit())
 
         return False
 
@@ -136,7 +143,9 @@ class IAlarm:
             log.debug("Received buffer of size %d", len(buffer))
 
             if not self._is_complete_message(buffer):
-                raise_connection_error("Connection error: incomplete message received.")
+                raise_connection_error(
+                    f"Connection error: incomplete message received. {buffer}"
+                )
 
             log.debug("Extracting payload from buffer of size %d", len(buffer))
             payload = buffer[16:-4]
