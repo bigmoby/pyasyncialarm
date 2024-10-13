@@ -108,9 +108,19 @@ class IAlarm:
         if buffer.startswith(start_delimiter_trigger):
             return buffer.endswith(end_delimiter_trigger)
 
-        if buffer.startswith((start_delimiter_type_standard, start_delimiter_type_list_2,
-                            start_delimiter_type_list_3, start_delimiter_type_list_4)):
-            return len(buffer) >= 4 and buffer[-4:].isdigit() and buffer.endswith(end_delimiter_standard)
+        if buffer.startswith(
+            (
+                start_delimiter_type_standard,
+                start_delimiter_type_list_2,
+                start_delimiter_type_list_3,
+                start_delimiter_type_list_4,
+            )
+        ):
+            return (
+                len(buffer) >= 4
+                and buffer[-4:].isdigit()
+                and buffer.endswith(end_delimiter_standard)
+            )
 
         return False
 
