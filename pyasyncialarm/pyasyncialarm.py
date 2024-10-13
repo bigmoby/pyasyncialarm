@@ -102,7 +102,7 @@ class IAlarm:
         start_delimiter_type_list_3 = b"@ieM03"
         start_delimiter_type_list_4 = b"@ieM04"
         start_delimiter_trigger = b"@alA0"
-        #end_delimiter_standard = b"0001"
+        # end_delimiter_standard = b"0001"
         end_delimiter_trigger = b"FFFF"
 
         if buffer.startswith(start_delimiter_trigger):
@@ -116,10 +116,7 @@ class IAlarm:
                 start_delimiter_type_list_4,
             )
         ):
-            return (
-                len(buffer) >= 4
-                and buffer[-4:].isdigit()
-            )
+            return len(buffer) >= 4 and buffer[-4:].isdigit()
 
         return False
 
