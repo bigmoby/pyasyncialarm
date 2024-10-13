@@ -53,21 +53,26 @@ class IAlarm:
     def _is_socket_open(self) -> bool:
         return self.sock is not None and self.sock.fileno() != -1
 
-    async def ensure_connection_is_open(self) -> None:
-        if not self._is_socket_open():
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.setblocking(False)
+    async def reconnect(self) -> None:
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setblocking(False)
+        self.seq = 0
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.sock_connect(self.sock, (self.host, self.port))
+        except (TimeoutError, OSError, ConnectionRefusedError) as err:
+            self._close_connection()
+            raise IAlarmConnectionError from err
+        except Exception:
+            self._close_connection()
+            raise
 
-            self.seq = 0
-            loop = asyncio.get_running_loop()
-            try:
-                await loop.sock_connect(self.sock, (self.host, self.port))
-            except (TimeoutError, OSError, ConnectionRefusedError) as err:
-                self._close_connection()
-                raise IAlarmConnectionError from err
-            except Exception:
-                self._close_connection()
-                raise
+    async def ensure_connection_is_open(self, force_reconnect: bool = False) -> None:
+        if force_reconnect:
+            log.debug("Forcing reconnect the socket...")
+            await self.reconnect()
+        elif not self._is_socket_open():
+            await self.reconnect()
         else:
             log.debug("Socket is already connected.")
 
