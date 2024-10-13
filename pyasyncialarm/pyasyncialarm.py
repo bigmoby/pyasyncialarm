@@ -80,34 +80,46 @@ class IAlarm:
         if self.sock and self.sock.fileno() != -1:
             self.sock.close()
 
+    def _truncate_bytes(self, buffer: bytes, sequence=b"FFFF"):
+        pos = buffer.find(sequence)
+        if pos != -1:
+            log.debug("Trigger message will be truncated")
+            return buffer[:pos]
+        return buffer
+
+    def _check_and_trim_trigger_response(self, buffer: bytes) -> bytes:
+        start_delimiter_trigger = b"@alA0"
+        if buffer.startswith(start_delimiter_trigger):
+            log.debug("It's a trigger message...")
+            return self._truncate_bytes(buffer)
+        return buffer
+
     def _is_complete_message(self, buffer: bytes) -> bool:
         """Check if the buffer contains a complete message based on the delimiters."""
 
-        start_delimiter_type_standard = b"@ieM01"
+        start_delimiter_type_standard = b"@ieM"
         start_delimiter_type_list_2 = b"@ieM02"
         start_delimiter_type_list_3 = b"@ieM03"
         start_delimiter_type_list_4 = b"@ieM04"
-        end_delimiter = b"0001"
-        end_delimiter_alarm_status_stay = b"0025"
-        end_delimiter_alarm_status_armed = b"0049"
+        start_delimiter_trigger = b"@alA0"
+        end_delimiter_standard = b"0001"
+        end_delimiter_trigger = b"FFFF"
+
+        if buffer.startswith(start_delimiter_trigger):
+            return buffer.endswith(end_delimiter_trigger)
 
         if buffer.startswith(start_delimiter_type_standard):
-            return buffer.endswith(
+            if buffer.startswith(
                 (
-                    end_delimiter,
-                    end_delimiter_alarm_status_stay,
-                    end_delimiter_alarm_status_armed,
+                    start_delimiter_type_list_2,
+                    start_delimiter_type_list_3,
+                    start_delimiter_type_list_4,
                 )
-            )
+            ):
+                return bool(len(buffer) >= 4 and buffer[-4:].isdigit())
 
-        if buffer.startswith(
-            (
-                start_delimiter_type_list_2,
-                start_delimiter_type_list_3,
-                start_delimiter_type_list_4,
-            )
-        ):
-            return bool(len(buffer) >= 4 and buffer[-4:].isdigit())
+            # If it starts with '@ieM', check only the end_delimiter
+            return buffer.endswith(end_delimiter_standard)
 
         return False
 
@@ -148,6 +160,10 @@ class IAlarm:
                 )
 
             log.debug("Extracting payload from buffer of size %d", len(buffer))
+
+            log.debug("Preprocess trigger messages if any...")
+            buffer = self._check_and_trim_trigger_response(buffer)
+
             payload = buffer[16:-4]
 
             decoded = (
