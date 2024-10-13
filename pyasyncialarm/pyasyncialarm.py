@@ -56,7 +56,7 @@ class IAlarm:
     async def ensure_connection_is_open(self) -> None:
         if not self._is_socket_open():
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(SOCKET_TIMEOUT)
+            self.sock.setblocking(False)
 
             self.seq = 0
             loop = asyncio.get_running_loop()
@@ -107,7 +107,7 @@ class IAlarm:
         """Receive and decode the message from the socket."""
 
         def raise_connection_error(msg: str):
-            """Chiude la connessione e solleva un'eccezione di connessione."""
+            """Close the connection and raises a connection error."""
             self._close_connection()
             raise ConnectionError(msg)
 
@@ -115,10 +115,15 @@ class IAlarm:
             buffer = b""
             await self.ensure_connection_is_open()
             log.debug("Attempting to receive data from the socket...")
+
             loop = asyncio.get_running_loop()
-            buffer = await asyncio.wait_for(
-                loop.sock_recv(self.sock, RECV_BUF_SIZE), timeout=SOCKET_TIMEOUT
-            )
+
+            try:
+                buffer = await asyncio.wait_for(
+                    loop.sock_recv(self.sock, RECV_BUF_SIZE), timeout=SOCKET_TIMEOUT
+                )
+            except TimeoutError:
+                raise_connection_error("Socket timeout: no data received.")
 
             if not buffer:
                 raise_connection_error("Connection error: received no data.")

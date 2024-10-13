@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name        = "pyasyncialarm"
-version     = "2.3.7"
+version     = "2.3.8"
 license     = {text = "MIT OR Apache-2.0"}
 description = "A simple library to interface with iAlarm systems, built for use with Home-Assistant"
 readme      = "README.md"
