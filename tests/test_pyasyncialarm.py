@@ -118,17 +118,19 @@ async def test_get_status_connection_error(ialarm):
     with pytest.raises(
         ConnectionError, match="An error occurred trying to connect to the alarm system"
     ):
-        await ialarm.get_status()
+        await ialarm.get_status([])
 
 
 @pytest.mark.asyncio
 async def test_get_status_unexpected_reply(ialarm):
     ialarm._send_request = AsyncMock(return_value={"DevStatus": -1})
 
+    zone_status_mock = []
+
     with pytest.raises(
         ConnectionError, match="Received an unexpected reply from the alarm"
     ):
-        await ialarm.get_status()
+        await ialarm.get_status(zone_status_mock)
 
 
 @pytest.mark.asyncio
@@ -136,11 +138,14 @@ async def test_get_status_triggered_alarm(ialarm):
     ialarm._send_request = AsyncMock(return_value={"DevStatus": ialarm.ARMED_AWAY})
 
     zone_status_mock = [
-        {"types": [StatusType.ZONE_ALARM]},
+        {"types": [StatusType.ZONE_ALARM, StatusType.ZONE_IN_USE]},
     ]
     ialarm.get_zone_status = AsyncMock(return_value=zone_status_mock)
 
-    status = await ialarm.get_status()
+    status = await ialarm.get_status(zone_status_mock)
+
+    print(f"Returned status: {status}")
+
     assert status == ialarm.TRIGGERED
 
 
@@ -153,7 +158,7 @@ async def test_get_status_no_triggered_alarm(ialarm):
     ]
     ialarm.get_zone_status = AsyncMock(return_value=zone_status_mock)
 
-    status = await ialarm.get_status()
+    status = await ialarm.get_status(zone_status_mock)
     assert status == ialarm.ARMED_AWAY
 
 
@@ -166,7 +171,8 @@ async def test_get_status_not_armed(ialarm):
     ]
     ialarm.get_zone_status = AsyncMock(return_value=zone_status_mock)
 
-    status = await ialarm.get_status()
+    status = await ialarm.get_status(zone_status_mock)
+
     assert status == 0
 
 
