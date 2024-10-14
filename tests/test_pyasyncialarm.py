@@ -144,8 +144,6 @@ async def test_get_status_triggered_alarm(ialarm):
 
     status = await ialarm.get_status(zone_status_mock)
 
-    print(f"Returned status: {status}")
-
     assert status == ialarm.TRIGGERED
 
 
