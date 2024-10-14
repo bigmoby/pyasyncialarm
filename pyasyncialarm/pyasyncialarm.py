@@ -121,16 +121,12 @@ class IAlarm:
         return False
 
     def __raise_connection_error(self, msg: str):
+        """Close the connection and raises a connection error."""
         self._close_connection()
         raise ConnectionError(msg)
 
     async def _receive(self):
         """Receive and decode the message from the socket."""
-
-        def raise_connection_error(msg: str):
-            """Close the connection and raises a connection error."""
-            self._close_connection()
-            raise ConnectionError(msg)
 
         try:
             buffer = b""
@@ -144,15 +140,15 @@ class IAlarm:
                     loop.sock_recv(self.sock, RECV_BUF_SIZE), timeout=SOCKET_TIMEOUT
                 )
             except TimeoutError:
-                raise_connection_error("Socket timeout: no data received.")
+                self.__raise_connection_error("Socket timeout: no data received.")
 
             if not buffer:
-                raise_connection_error("Connection error: received no data.")
+                self.__raise_connection_error("Connection error: received no data.")
 
             log.debug("Received buffer of size %d", len(buffer))
 
             if not self._is_complete_message(buffer):
-                raise_connection_error(
+                self.__raise_connection_error(
                     f"Connection error: incomplete message received. {buffer}"
                 )
 
@@ -172,7 +168,9 @@ class IAlarm:
             log.debug("Decoded message: %s", decoded)
 
             if not decoded:
-                raise_connection_error("Connection error: unexpected empty reply.")
+                self.__raise_connection_error(
+                    "Connection error: unexpected empty reply."
+                )
 
             return await self._parse_decoded_message(decoded)
 
@@ -198,6 +196,7 @@ class IAlarm:
             )
         except xml.parsers.expat.ExpatError as e:
             log.error("XML Parsing error: %s", e)
+            log.error("Tried to decode [%s]", decoded)
             self.__raise_connection_error("Received malformed XML response")
 
     async def _send_request_list(
@@ -315,7 +314,7 @@ class IAlarm:
 
         return result
 
-    async def get_status(self) -> int:
+    async def get_status(self, extra_info_zone_status: list[ZoneStatusType]) -> int:
         command: OrderedDict[str, Optional[Any]] = OrderedDict()
         command["DevStatus"] = None
         command["Err"] = None
@@ -333,16 +332,22 @@ class IAlarm:
             error_message = "Received an unexpected reply from the alarm"
             raise ConnectionError(error_message)
 
-        if status in {self.ARMED_AWAY, self.ARMED_STAY}:
-            zone_status: list[ZoneStatusType] = await self.get_zone_status()
-            zone_alarm = any(
-                StatusType.ZONE_ALARM in zone["types"] for zone in zone_status
-            )
-
-            if zone_alarm:
+        if status in {self.ARMED_AWAY, self.ARMED_STAY} and extra_info_zone_status:
+            alarmed_zones = self.__filter_alarmed_zones(extra_info_zone_status)
+            if any(StatusType.ZONE_ALARM in zone["types"] for zone in alarmed_zones):
                 return self.TRIGGERED
 
         return status
+
+    def __filter_alarmed_zones(
+        self, extra_info_zone_status: list[ZoneStatusType]
+    ) -> list[ZoneStatusType]:
+        return [
+            zone
+            for zone in extra_info_zone_status
+            if StatusType.ZONE_ALARM in zone["types"]
+            and StatusType.ZONE_IN_USE in zone["types"]
+        ]
 
     async def get_log(self) -> list[LogEntryType]:
         command: OrderedDict[str, Optional[Any]] = OrderedDict()
