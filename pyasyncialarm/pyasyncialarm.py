@@ -15,6 +15,7 @@ from pyasyncialarm.const import (
     RECV_BUF_SIZE,
     SOCKET_TIMEOUT,
     ZONE_TYPE_MAP,
+    AlarmStatusType,
     LogEntryType,
     LogEntryTypeRaw,
     SirenSoundTypeEnum,
@@ -314,7 +315,18 @@ class IAlarm:
 
         return result
 
-    async def get_status(self, extra_info_zone_status: list[ZoneStatusType]) -> int:
+    def __create_ialarm_status(
+        self, status_value: int, zones: list[ZoneStatusType] | None = None
+    ) -> AlarmStatusType:
+        alarm_status: AlarmStatusType = {
+            "status_value": status_value,
+            "alarmed_zones": zones if zones is not None else [],
+        }
+        return alarm_status
+
+    async def get_status(
+        self, extra_info_zone_status: list[ZoneStatusType]
+    ) -> AlarmStatusType:
         command: OrderedDict[str, Optional[Any]] = OrderedDict()
         command["DevStatus"] = None
         command["Err"] = None
@@ -333,11 +345,13 @@ class IAlarm:
             raise ConnectionError(error_message)
 
         if status in {self.ARMED_AWAY, self.ARMED_STAY} and extra_info_zone_status:
-            alarmed_zones = self.__filter_alarmed_zones(extra_info_zone_status)
+            alarmed_zones: list[ZoneStatusType] = self.__filter_alarmed_zones(
+                extra_info_zone_status
+            )
             if any(StatusType.ZONE_ALARM in zone["types"] for zone in alarmed_zones):
-                return self.TRIGGERED
+                return self.__create_ialarm_status(self.TRIGGERED, alarmed_zones)
 
-        return status
+        return self.__create_ialarm_status(status)
 
     def __filter_alarmed_zones(
         self, extra_info_zone_status: list[ZoneStatusType]

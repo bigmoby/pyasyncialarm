@@ -101,6 +101,11 @@ class ZoneStatusType(TypedDict):
     types: list[StatusType]
 
 
+class AlarmStatusType(TypedDict):
+    status_value: int
+    alarmed_zones: list[ZoneStatusType] | None
+
+
 class ZoneTypeEnum(str, Enum):
     UNUSED = "Unused"
     DELAY = "Delay"
