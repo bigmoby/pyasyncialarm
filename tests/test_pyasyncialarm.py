@@ -125,12 +125,10 @@ async def test_get_status_connection_error(ialarm):
 async def test_get_status_unexpected_reply(ialarm):
     ialarm._send_request = AsyncMock(return_value={"DevStatus": -1})
 
-    zone_status_mock = []
-
     with pytest.raises(
         ConnectionError, match="Received an unexpected reply from the alarm"
     ):
-        await ialarm.get_status(zone_status_mock)
+        await ialarm.get_status([])
 
 
 @pytest.mark.asyncio
@@ -138,13 +136,13 @@ async def test_get_status_triggered_alarm(ialarm):
     ialarm._send_request = AsyncMock(return_value={"DevStatus": ialarm.ARMED_AWAY})
 
     zone_status_mock = [
-        {"types": [StatusType.ZONE_ALARM, StatusType.ZONE_IN_USE]},
+        {"types": [StatusType.ZONE_ALARM, StatusType.ZONE_IN_USE]},  # Should trigger
     ]
-    ialarm.get_zone_status = AsyncMock(return_value=zone_status_mock)
 
-    status = await ialarm.get_status(zone_status_mock)
+    ialarm.__filter_alarmed_zones = AsyncMock(return_value=zone_status_mock)
 
-    assert status == ialarm.TRIGGERED
+    result = await ialarm.get_status(zone_status_mock)
+    assert result["status_value"] == ialarm.TRIGGERED
 
 
 @pytest.mark.asyncio
@@ -152,12 +150,13 @@ async def test_get_status_no_triggered_alarm(ialarm):
     ialarm._send_request = AsyncMock(return_value={"DevStatus": ialarm.ARMED_AWAY})
 
     zone_status_mock = [
-        {"types": []},
+        {"types": [StatusType.ZONE_IN_USE]},
     ]
-    ialarm.get_zone_status = AsyncMock(return_value=zone_status_mock)
 
-    status = await ialarm.get_status(zone_status_mock)
-    assert status == ialarm.ARMED_AWAY
+    ialarm.__filter_alarmed_zones = AsyncMock(return_value=zone_status_mock)
+
+    result = await ialarm.get_status(zone_status_mock)
+    assert result["status_value"] == ialarm.ARMED_AWAY
 
 
 @pytest.mark.asyncio
@@ -169,9 +168,9 @@ async def test_get_status_not_armed(ialarm):
     ]
     ialarm.get_zone_status = AsyncMock(return_value=zone_status_mock)
 
-    status = await ialarm.get_status(zone_status_mock)
+    result = await ialarm.get_status(zone_status_mock)
 
-    assert status == 0
+    assert result["status_value"] == ialarm.ARMED_AWAY
 
 
 @pytest.mark.asyncio
