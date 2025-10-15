@@ -3,7 +3,7 @@ from collections import OrderedDict
 import logging
 import re
 import socket
-from typing import Any, Optional
+from typing import Any
 import xml.parsers.expat
 
 import dicttoxml2
@@ -203,12 +203,12 @@ class IAlarm:
     async def _send_request_list(
         self,
         xpath: str,
-        command: OrderedDict[str, Optional[Any]],
+        command: OrderedDict[str, Any | None],
         offset: int = 0,
-        partial_list: Optional[list[Any]] = None,
+        partial_list: list[Any] | None = None,
     ) -> list[Any]:
         if offset > 0:
-            command["Offset"] = "S32,0,0|%d" % offset
+            command["Offset"] = f"S32,0,0|{offset}"
         root_dict: dict[str, Any] = self._create_root_dict(xpath, command)
         await self._send_dict(root_dict)
         response: dict[str, Any] = await self._receive()
@@ -226,7 +226,7 @@ class IAlarm:
         return partial_list
 
     async def _send_request(
-        self, xpath: str, command: OrderedDict[str, Optional[Any]]
+        self, xpath: str, command: OrderedDict[str, Any | None]
     ) -> dict[str, Any]:
         root_dict = self._create_root_dict(xpath, command)
         await self._send_dict(root_dict)
@@ -236,7 +236,7 @@ class IAlarm:
 
     async def get_mac(self) -> str:
         mac = ""
-        command: OrderedDict[str, Optional[Any]] = OrderedDict()
+        command: OrderedDict[str, Any | None] = OrderedDict()
         command["Mac"] = None
         command["Name"] = None
         command["Ip"] = None
@@ -269,7 +269,7 @@ class IAlarm:
 
         zone_name_map = {zone["zone_id"]: zone["name"] for zone in zones}
 
-        command: OrderedDict[str, Optional[Any]] = OrderedDict()
+        command: OrderedDict[str, Any | None] = OrderedDict()
         command["Total"] = None
         command["Offset"] = "S32,0,0|0"
         command["Ln"] = None
@@ -327,7 +327,7 @@ class IAlarm:
     async def get_status(
         self, extra_info_zone_status: list[ZoneStatusType]
     ) -> AlarmStatusType:
-        command: OrderedDict[str, Optional[Any]] = OrderedDict()
+        command: OrderedDict[str, Any | None] = OrderedDict()
         command["DevStatus"] = None
         command["Err"] = None
 
@@ -364,7 +364,7 @@ class IAlarm:
         ]
 
     async def get_log(self) -> list[LogEntryType]:
-        command: OrderedDict[str, Optional[Any]] = OrderedDict()
+        command: OrderedDict[str, Any | None] = OrderedDict()
         command["Total"] = None
         command["Offset"] = "S32,0,0|0"
         command["Ln"] = None
@@ -399,7 +399,7 @@ class IAlarm:
         ]
 
     async def get_zone(self) -> list[ZoneType]:
-        command: OrderedDict[str, Optional[Any]] = OrderedDict()
+        command: OrderedDict[str, Any | None] = OrderedDict()
         command["Total"] = None
         command["Offset"] = "S32,0,0|0"
         command["Ln"] = None
@@ -413,7 +413,7 @@ class IAlarm:
         return zone
 
     async def get_zone_type(self) -> list[ZoneTypeEnum]:
-        command: OrderedDict[str, Optional[Any]] = OrderedDict()
+        command: OrderedDict[str, Any | None] = OrderedDict()
         command["Total"] = None
         command["Offset"] = "S32,0,0|0"
         command["Ln"] = None
@@ -429,7 +429,7 @@ class IAlarm:
         return zone_types
 
     async def get_alarm_type(self) -> list[SirenSoundTypeEnum]:
-        command: OrderedDict[str, Optional[Any]] = OrderedDict()
+        command: OrderedDict[str, Any | None] = OrderedDict()
         command["Total"] = None
         command["Offset"] = "S32,0,0|0"
         command["Ln"] = None
@@ -446,25 +446,25 @@ class IAlarm:
         return zone_types
 
     async def arm_away(self) -> None:
-        command: OrderedDict[str, Optional[Any]] = OrderedDict()
+        command: OrderedDict[str, Any | None] = OrderedDict()
         command["DevStatus"] = "TYP,ARM|0"
         command["Err"] = None
         await self._send_request("/Root/Host/SetAlarmStatus", command)
 
     async def arm_stay(self) -> None:
-        command: OrderedDict[str, Optional[Any]] = OrderedDict()
+        command: OrderedDict[str, Any | None] = OrderedDict()
         command["DevStatus"] = "TYP,STAY|2"
         command["Err"] = None
         await self._send_request("/Root/Host/SetAlarmStatus", command)
 
     async def disarm(self) -> None:
-        command: OrderedDict[str, Optional[Any]] = OrderedDict()
+        command: OrderedDict[str, Any | None] = OrderedDict()
         command["DevStatus"] = "TYP,DISARM|1"
         command["Err"] = None
         await self._send_request("/Root/Host/SetAlarmStatus", command)
 
     async def cancel_alarm(self) -> None:
-        command: OrderedDict[str, Optional[Any]] = OrderedDict()
+        command: OrderedDict[str, Any | None] = OrderedDict()
         command["DevStatus"] = "TYP,CLEAR|3"
         command["Err"] = None
         await self._send_request("/Root/Host/SetAlarmStatus", command)

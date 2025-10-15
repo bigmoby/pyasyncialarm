@@ -2,11 +2,11 @@
 
 from datetime import datetime
 from enum import Enum, IntEnum
-from typing import Optional, TypedDict
+from typing import TypedDict
 
 
 class LogEntryType(TypedDict):
-    time: Optional[datetime]
+    time: datetime | None
     area: int
     event: str
     name: str

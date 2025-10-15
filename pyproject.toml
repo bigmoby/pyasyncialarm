@@ -388,7 +388,7 @@ log_format = "%(asctime)s.%(msecs)03d %(levelname)-8s %(threadName)s %(name)s:%(
 log_date_format = "%Y-%m-%d %H:%M:%S"
 asyncio_mode = "auto"
 filterwarnings = [
-    "error::sqlalchemy.exc.SAWarning",
+    # "error::sqlalchemy.exc.SAWarning",  # Commented out - sqlalchemy not used in this project
 
     # -- HomeAssistant - aiohttp
     # Overwrite web.Application to pass a custom default argument to _make_request
@@ -603,7 +603,7 @@ select = [
     "S317", # suspicious-xml-sax-usage
     "S318", # suspicious-xml-mini-dom-usage
     "S319", # suspicious-xml-pull-dom-usage
-    "S320", # suspicious-xmle-tree-usage
+    "S319", # suspicious-xmle-tree-usage
     "S601", # paramiko-call
     "S602", # subprocess-popen-with-shell-equals-true
     "S604", # call-with-shell-equals-true

@@ -1,32 +1,46 @@
 default_language_version:
-  python: python3.12
+  python: python3.13
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.3.5
+    rev: v0.14.0
     hooks:
       - id: ruff
         args:
           - --fix
+      - id: ruff-format
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.5.0
+    rev: v4.6.0
     hooks:
       - id: check-yaml
         args: ["--unsafe"]
       - id: end-of-file-fixer
       - id: trailing-whitespace
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: debug-statements
   - repo: https://github.com/psf/black
-    rev: 23.10.1
+    rev: 24.10.0
     hooks:
       - id: black
         args:
           - --line-length=88
           - --preview
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.9.0
+    rev: v1.13.0
     hooks:
       - id: mypy
         args: [--strict]
         language: python
-        language_version: python3.12
+        language_version: python3.13
         additional_dependencies:
-          - "pydantic>=1.10.12"
+          - "pydantic>=2.0.0"
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: pytest
+        language: system
+        files: ^tests/.*\.py$
+        args:
+          - tests/test_pyasyncialarm.py
+          - -v

@@ -1,10 +1,9 @@
 """Utils for iAlarm Home Assistant Integration."""
 
 from datetime import datetime
-from typing import Optional
 
 
-def parse_time(time_str: str) -> Optional[datetime]:
+def parse_time(time_str: str) -> datetime | None:
     """Convert a time string to a datetime object."""
     if "DTA,19" in time_str:
         try:

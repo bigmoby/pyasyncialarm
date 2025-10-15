@@ -1,5 +1,6 @@
 """Exceptions for iAlarm Home Assistant Integration."""
 
+
 class IAlarmSocketNotOpenError(ConnectionError):
     """Exception raised when socket is not open."""
 
