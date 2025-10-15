@@ -1,4 +1,4 @@
-name: "Lint"
+name: "Test"
 
 on:
   push:
@@ -9,12 +9,12 @@ on:
       - "main"
 
 jobs:
-  ruff:
-    name: "Ruff"
+  test:
+    name: "Test"
     runs-on: "ubuntu-latest"
     steps:
       - name: "Checkout the repository"
-        uses: "actions/checkout@v4.1.7"
+        uses: "actions/checkout@v4"
 
       - name: "Set up Python"
         uses: actions/setup-python@v5
@@ -25,5 +25,13 @@ jobs:
       - name: "Install requirements"
         run: python3 -m pip install -r requirements.txt
 
-      - name: "Run"
-        run: python3 -m ruff check .
+      - name: "Run tests"
+        run: python3 -m pytest tests/ -v --cov=pyasyncialarm --cov-report=xml
+
+      - name: "Upload coverage to Codecov"
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
