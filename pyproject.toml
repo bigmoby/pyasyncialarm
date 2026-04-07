@@ -9,14 +9,13 @@ license     = {text = "Apache-2.0"}
 description = "A simple library to interface with iAlarm systems, built for use with Home-Assistant"
 readme      = "README.md"
 authors     = [
-    {name = "Fabio Bigmoby Mauro", email = "[EMAIL_ADDRESS]"}
+    {name = "Fabio Bigmoby Mauro", email = "bigmoby@example.com"}
 ]
 keywords    = ["ialarm", "antifurtocasa365", "alarm"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3.14",
-    "License :: OSI Approved :: MIT License",
     "License :: OSI Approved :: Apache Software License",
     "Topic :: Software Development :: Libraries",
 ]
