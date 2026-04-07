@@ -990,6 +990,7 @@ async def test_send_request_with_connection_close(ialarm):
         mock_create.return_value = {"Root": {"Test": "value"}}
 
         with (
+            patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock),
             patch.object(ialarm, "_send_dict", new_callable=AsyncMock),
             patch.object(ialarm, "_receive", new_callable=AsyncMock) as mock_receive,
             patch.object(ialarm, "_close_connection") as mock_close,
