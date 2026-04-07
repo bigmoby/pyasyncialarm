@@ -51,10 +51,11 @@ async def test_receive(ialarm):
 
         with patch("asyncio.get_running_loop") as mock_event_loop:
             mock_event_loop_instance = mock_event_loop.return_value
+            mock_event_loop_instance.time.return_value = 0.0
+            # Valid frame: @ieM + len(4) + seq(4) + 0000 + payload(len bytes) + seq(4)
+            # len=0002, seq=0001, payload=2 bytes "AB", trailing=0001
             mock_event_loop_instance.sock_recv = AsyncMock(
-                return_value=(
-                    b"@ieM00020000<Root><Data>Mocked XML Data</Data></Root>0001"
-                )
+                return_value=b"@ieM000200010000AB0001"
             )
 
             with patch.object(
@@ -177,31 +178,27 @@ async def test_get_status_not_armed(ialarm):
 
 @pytest.mark.asyncio
 async def test_get_zone_status_success(ialarm):
-    ialarm.get_zone = AsyncMock(
-        return_value=[
-            {"zone_id": 1, "name": "Zone 1", "type": 1, "voice": 0, "bell": False},
-            {"zone_id": 2, "name": "Zone 2", "type": 1, "voice": 0, "bell": False},
-        ]
-    )
-
-    ialarm._send_request_list = AsyncMock(
-        return_value=[
-            StatusType.ZONE_IN_USE | StatusType.ZONE_ALARM,
-            StatusType.ZONE_BYPASS,
-        ]
-    )
-
-    expected_result = [
-        {
-            "zone_id": 1,
-            "name": "Zone 1",
-            "types": [StatusType.ZONE_IN_USE, StatusType.ZONE_ALARM],
-        },
-        {"zone_id": 2, "name": "Zone 2", "types": [StatusType.ZONE_BYPASS]},
+    raw_zone_data = [
+        {"Name": "GBA,8|5A6F6E6531", "Type": 1, "Voice": 0, "Bell": "BOL|F"},
+        {"Name": "GBA,8|5A6F6E6532", "Type": 1, "Voice": 0, "Bell": "BOL|F"},
+    ]
+    zone_status = [
+        StatusType.ZONE_IN_USE | StatusType.ZONE_ALARM,
+        StatusType.ZONE_BYPASS,
     ]
 
-    result = await ialarm.get_zone_status()
-    assert result == expected_result
+    ialarm._send_request_list = AsyncMock(side_effect=[raw_zone_data, zone_status])
+
+    with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
+        with patch.object(ialarm, "_close_connection"):
+            result = await ialarm.get_zone_status()
+
+    assert len(result) == 2
+    assert result[0]["zone_id"] == 1
+    assert StatusType.ZONE_IN_USE in result[0]["types"]
+    assert StatusType.ZONE_ALARM in result[0]["types"]
+    assert result[1]["zone_id"] == 2
+    assert StatusType.ZONE_BYPASS in result[1]["types"]
 
 
 @pytest.mark.asyncio
@@ -216,36 +213,37 @@ async def test_get_zone_status_no_zones(ialarm):
 
 @pytest.mark.asyncio
 async def test_get_zone_status_connection_error(ialarm):
-    ialarm.get_zone = AsyncMock(
-        return_value=[
-            {"zone_id": 1, "name": "Zone 1"},
-        ]
-    )
+    raw_zone_data = [
+        {"Name": "GBA,8|5A6F6E6531", "Type": 1, "Voice": 0, "Bell": "BOL|F"}
+    ]
 
-    ialarm._send_request_list = AsyncMock(return_value=None)
+    ialarm._send_request_list = AsyncMock(side_effect=[raw_zone_data, None])
 
-    with pytest.raises(
-        ConnectionError, match="An error occurred trying to connect to the alarm system"
-    ):
-        await ialarm.get_zone_status()
+    with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
+        with patch.object(ialarm, "_close_connection"):
+            with pytest.raises(
+                ConnectionError,
+                match="An error occurred trying to connect to the alarm system",
+            ):
+                await ialarm.get_zone_status()
 
 
 @pytest.mark.asyncio
 async def test_get_zone_status_no_status(ialarm):
-    ialarm.get_zone = AsyncMock(
-        return_value=[
-            {"zone_id": 1, "name": "Zone 1"},
-        ]
-    )
-
-    ialarm._send_request_list = AsyncMock(return_value=[0])
-
-    expected_result = [
-        {"zone_id": 1, "name": "Zone 1", "types": [StatusType.ZONE_NOT_USED]},
+    raw_zone_data = [
+        {"Name": "GBA,8|5A6F6E6531", "Type": 1, "Voice": 0, "Bell": "BOL|F"}
     ]
+    zone_status = [0]
 
-    result = await ialarm.get_zone_status()
-    assert result == expected_result
+    ialarm._send_request_list = AsyncMock(side_effect=[raw_zone_data, zone_status])
+
+    with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
+        with patch.object(ialarm, "_close_connection"):
+            result = await ialarm.get_zone_status()
+
+    assert len(result) == 1
+    assert result[0]["zone_id"] == 1
+    assert result[0]["types"] == [StatusType.ZONE_NOT_USED]
 
 
 @pytest.mark.asyncio
@@ -693,69 +691,53 @@ def test_xmlread_postprocessor(xml_input, expected_pattern):
     assert isinstance(processed_value, (int, str))
 
 
-def test_is_complete_message_standard():
-    """Test _is_complete_message with standard message."""
+def test_frame_complete_standard():
+    """Test _frame_complete with a complete standard @ieM frame."""
     ialarm = IAlarm("192.168.1.81")
 
-    # Standard message ending with 4 digits
-    buffer = b"@ieM00020000<Root><Data>Test</Data></Root>0001"
-    assert ialarm._is_complete_message(buffer) is True
+    # @ieM + len(4) + seq(4) + 0000 + payload(len bytes) + seq(4)
+    # len=0002, seq=0001, payload=2 bytes, total=16+2+4=22
+    payload = b"AB"
+    seq = b"0001"
+    buffer = b"@ieM" + b"0002" + seq + b"0000" + payload + seq
+    assert ialarm._frame_complete(buffer) is True
 
 
-def test_is_complete_message_trigger():
-    """Test _is_complete_message with trigger message."""
-    ialarm = IAlarm("192.168.1.81")
-
-    # Trigger message ending with FFFF
-    buffer = b"@alA0<Trigger>Data</Trigger>FFFF"
-    assert ialarm._is_complete_message(buffer) is True
-
-
-def test_is_complete_message_incomplete():
-    """Test _is_complete_message with incomplete message."""
-    ialarm = IAlarm("192.168.1.81")
-
-    # Incomplete message
-    buffer = b"@ieM00020000<Root><Data>Test</Data></Root>"
-    assert ialarm._is_complete_message(buffer) is False
-
-
-def test_truncate_bytes():
-    """Test _truncate_bytes method."""
-    ialarm = IAlarm("192.168.1.81")
-
-    buffer = b"Some data before FFFF and after"
-    result = ialarm._truncate_bytes(buffer)
-
-    assert result == b"Some data before "
-
-
-def test_truncate_bytes_no_sequence():
-    """Test _truncate_bytes with no sequence found."""
-    ialarm = IAlarm("192.168.1.81")
-
-    buffer = b"Some data without sequence"
-    result = ialarm._truncate_bytes(buffer)
-
-    assert result == buffer
-
-
-def test_check_and_trim_trigger_response():
-    """Test _check_and_trim_trigger_response method."""
+def test_frame_complete_trigger():
+    """Test _frame_complete with a complete trigger frame."""
     ialarm = IAlarm("192.168.1.81")
 
     buffer = b"@alA0<Trigger>Data</Trigger>FFFF"
-    result = ialarm._check_and_trim_trigger_response(buffer)
-
-    assert result == b"@alA0<Trigger>Data</Trigger>"
+    assert ialarm._frame_complete(buffer) is True
 
 
-def test_check_and_trim_trigger_response_not_trigger():
-    """Test _check_and_trim_trigger_response with non-trigger message."""
+def test_frame_complete_incomplete():
+    """Test _frame_complete with an incomplete frame."""
     ialarm = IAlarm("192.168.1.81")
 
-    buffer = b"@ieM00020000<Root><Data>Test</Data></Root>0001"
-    result = ialarm._check_and_trim_trigger_response(buffer)
+    # Missing trailing seq
+    buffer = b"@ieM0002000100AB"
+    assert ialarm._frame_complete(buffer) is False
+
+
+def test_strip_leading_trigger_frames_removes_complete():
+    """Test _strip_leading_trigger_frames discards complete trigger frames."""
+    ialarm = IAlarm("192.168.1.81")
+
+    trigger = b"@alA0<Trigger>Data</Trigger>FFFF"
+    standard = b"@ieM00020001000000AB0001"
+    buffer = trigger + standard
+    result = ialarm._strip_leading_trigger_frames(buffer)
+
+    assert result == standard
+
+
+def test_strip_leading_trigger_frames_no_trigger():
+    """Test _strip_leading_trigger_frames with no trigger prefix is a no-op."""
+    ialarm = IAlarm("192.168.1.81")
+
+    buffer = b"@ieM00020001000000AB0001"
+    result = ialarm._strip_leading_trigger_frames(buffer)
 
     assert result == buffer
 
@@ -829,13 +811,12 @@ async def test_receive_timeout_error(ialarm):
 
         with patch("asyncio.get_running_loop") as mock_loop:
             mock_loop_instance = mock_loop.return_value
+            mock_loop_instance.time.return_value = 0.0
             mock_loop_instance.sock_recv = AsyncMock(
                 side_effect=TimeoutError("Socket timeout")
             )
 
-            with pytest.raises(
-                ConnectionError, match="Socket timeout: no data received"
-            ):
+            with pytest.raises(ConnectionError, match="Socket timeout"):
                 await ialarm._receive()
 
 
@@ -849,10 +830,11 @@ async def test_receive_empty_buffer(ialarm):
 
         with patch("asyncio.get_running_loop") as mock_loop:
             mock_loop_instance = mock_loop.return_value
+            mock_loop_instance.time.return_value = 0.0
             mock_loop_instance.sock_recv = AsyncMock(return_value=b"")
 
             with pytest.raises(
-                ConnectionError, match="Connection error: received no data"
+                ConnectionError, match="Connection closed by remote host"
             ):
                 await ialarm._receive()
 
@@ -867,8 +849,10 @@ async def test_receive_empty_decoded_message(ialarm):
 
         with patch("asyncio.get_running_loop") as mock_loop:
             mock_loop_instance = mock_loop.return_value
+            mock_loop_instance.time.return_value = 0.0
+            # Valid frame: seq(0001) matches at both header and trailer
             mock_loop_instance.sock_recv = AsyncMock(
-                return_value=b"@ieM00020000<Root></Root>0001"
+                return_value=b"@ieM000200010000AB0001"
             )
 
             with (
@@ -890,6 +874,7 @@ async def test_receive_os_error(ialarm):
 
         with patch("asyncio.get_running_loop") as mock_loop:
             mock_loop_instance = mock_loop.return_value
+            mock_loop_instance.time.return_value = 0.0
             mock_loop_instance.sock_recv = AsyncMock(
                 side_effect=OSError("Network error")
             )
@@ -908,6 +893,7 @@ async def test_receive_generic_exception(ialarm):
 
         with patch("asyncio.get_running_loop") as mock_loop:
             mock_loop_instance = mock_loop.return_value
+            mock_loop_instance.time.return_value = 0.0
             mock_loop_instance.sock_recv = AsyncMock(
                 side_effect=RuntimeError("Unexpected error")
             )
@@ -1037,22 +1023,20 @@ async def test_send_dict_method(ialarm):
 @pytest.mark.asyncio
 async def test_get_zone_status_multiple_status_types(ialarm):
     """Test get_zone_status with zones having multiple status types."""
-    ialarm.get_zone = AsyncMock(
-        return_value=[
-            {"zone_id": 1, "name": "Zone 1", "type": 1, "voice": 0, "bell": False},
-            {"zone_id": 2, "name": "Zone 2", "type": 1, "voice": 0, "bell": False},
-        ]
-    )
+    raw_zone_data = [
+        {"Name": "GBA,8|5A6F6E6531", "Type": 1, "Voice": 0, "Bell": "BOL|F"},
+        {"Name": "GBA,8|5A6F6E6532", "Type": 1, "Voice": 0, "Bell": "BOL|F"},
+    ]
+    zone_status = [
+        StatusType.ZONE_IN_USE | StatusType.ZONE_ALARM | StatusType.ZONE_BYPASS,
+        StatusType.ZONE_IN_USE | StatusType.ZONE_FAULT,
+    ]
 
-    # Zone with multiple status types (IN_USE + ALARM + BYPASS)
-    ialarm._send_request_list = AsyncMock(
-        return_value=[
-            StatusType.ZONE_IN_USE | StatusType.ZONE_ALARM | StatusType.ZONE_BYPASS,
-            StatusType.ZONE_IN_USE | StatusType.ZONE_FAULT,
-        ]
-    )
+    ialarm._send_request_list = AsyncMock(side_effect=[raw_zone_data, zone_status])
 
-    result = await ialarm.get_zone_status()
+    with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
+        with patch.object(ialarm, "_close_connection"):
+            result = await ialarm.get_zone_status()
 
     assert len(result) == 2
     assert result[0]["zone_id"] == 1
@@ -1068,20 +1052,18 @@ async def test_get_zone_status_multiple_status_types(ialarm):
 @pytest.mark.asyncio
 async def test_get_zone_status_low_battery_and_loss(ialarm):
     """Test get_zone_status with low battery and loss status."""
-    ialarm.get_zone = AsyncMock(
-        return_value=[
-            {"zone_id": 1, "name": "Zone 1", "type": 1, "voice": 0, "bell": False},
-        ]
-    )
+    raw_zone_data = [
+        {"Name": "GBA,8|5A6F6E6531", "Type": 1, "Voice": 0, "Bell": "BOL|F"},
+    ]
+    zone_status = [
+        StatusType.ZONE_IN_USE | StatusType.ZONE_LOW_BATTERY | StatusType.ZONE_LOSS,
+    ]
 
-    # Zone with low battery and loss
-    ialarm._send_request_list = AsyncMock(
-        return_value=[
-            StatusType.ZONE_IN_USE | StatusType.ZONE_LOW_BATTERY | StatusType.ZONE_LOSS,
-        ]
-    )
+    ialarm._send_request_list = AsyncMock(side_effect=[raw_zone_data, zone_status])
 
-    result = await ialarm.get_zone_status()
+    with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
+        with patch.object(ialarm, "_close_connection"):
+            result = await ialarm.get_zone_status()
 
     assert len(result) == 1
     assert result[0]["zone_id"] == 1
@@ -1106,47 +1088,32 @@ def test_exception_ialarm_connection_error():
     assert isinstance(error, ConnectionError)
 
 
-def test_is_complete_message_list_variants():
-    """Test _is_complete_message with different list variants."""
+def test_frame_complete_list_variants():
+    """Test _frame_complete with different seq numbers."""
     ialarm = IAlarm("192.168.1.81")
 
-    # Test @ieM02 variant
-    buffer = b"@ieM020000<Root><Data>Test</Data></Root>0001"
-    assert ialarm._is_complete_message(buffer) is True
-
-    # Test @ieM03 variant
-    buffer = b"@ieM030000<Root><Data>Test</Data></Root>0001"
-    assert ialarm._is_complete_message(buffer) is True
-
-    # Test @ieM04 variant
-    buffer = b"@ieM040000<Root><Data>Test</Data></Root>0001"
-    assert ialarm._is_complete_message(buffer) is True
+    for seq in [b"0002", b"0003", b"0004"]:
+        payload = b"AB"  # 2 bytes
+        buffer = b"@ieM" + b"0002" + seq + b"0000" + payload + seq
+        assert ialarm._frame_complete(buffer) is True
 
 
-def test_is_complete_message_invalid_endings():
-    """Test _is_complete_message with invalid endings."""
+def test_frame_complete_trailing_seq_mismatch():
+    """Test _frame_complete when trailing seq does not match header seq."""
     ialarm = IAlarm("192.168.1.81")
 
-    # Test with non-digit ending
-    buffer = b"@ieM00020000<Root><Data>Test</Data></Root>ABCD"
-    assert ialarm._is_complete_message(buffer) is False
-
-    # Test with too short buffer
-    buffer = b"@ieM00020000<Root><Data>Test</Data></Root>"
-    assert ialarm._is_complete_message(buffer) is False
-
-    # Test with non-trigger message without proper ending
-    buffer = b"@ieM00020000<Root><Data>Test</Data></Root>"
-    assert ialarm._is_complete_message(buffer) is False
+    payload = b"AB"  # 2 bytes, len=0002
+    # header seq=0001 but trailing seq=0002 — should be False
+    buffer = b"@ieM" + b"0002" + b"0001" + b"0000" + payload + b"0002"
+    assert ialarm._frame_complete(buffer) is False
 
 
-def test_is_complete_message_unknown_prefix():
-    """Test _is_complete_message with unknown prefix."""
+def test_frame_complete_unknown_prefix():
+    """Test _frame_complete with an unknown frame prefix returns False."""
     ialarm = IAlarm("192.168.1.81")
 
-    # Test with unknown prefix
     buffer = b"@unknown00020000<Root><Data>Test</Data></Root>0001"
-    assert ialarm._is_complete_message(buffer) is False
+    assert ialarm._frame_complete(buffer) is False
 
 
 def test_xmlread_with_none_value():
@@ -1223,7 +1190,7 @@ def test_parse_bell_with_empty_string():
 
 @pytest.mark.asyncio
 async def test_receive_incomplete_message(ialarm):
-    """Test _receive with incomplete message to reach 100% coverage."""
+    """Test _receive with incomplete message accumulates until timeout."""
     with patch("socket.socket") as mock_socket:
         mock_socket_instance = mock_socket.return_value
         mock_socket_instance.fileno.return_value = 1
@@ -1231,12 +1198,13 @@ async def test_receive_incomplete_message(ialarm):
 
         with patch("asyncio.get_running_loop") as mock_loop:
             mock_loop_instance = mock_loop.return_value
-            # Return an incomplete message (missing ending digits)
+            # time() first returns 0 (deadline = SOCKET_TIMEOUT), then returns
+            # a value past the deadline so the loop exits with a timeout error.
+            mock_loop_instance.time.side_effect = [0.0, 0.0, 9999.0]
+            # Return an incomplete frame on every recv
             mock_loop_instance.sock_recv = AsyncMock(
                 return_value=b"@ieM00020000<Root><Data>Test</Data></Root>"
             )
 
-            with pytest.raises(
-                ConnectionError, match="Connection error: incomplete message received"
-            ):
+            with pytest.raises(ConnectionError, match="Socket timeout"):
                 await ialarm._receive()

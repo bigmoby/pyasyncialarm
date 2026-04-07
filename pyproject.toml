@@ -4,23 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name        = "pyasyncialarm"
-version     = "2.3.17"
-license     = {text = "MIT OR Apache-2.0"}
+version     = "2.3.18"
+license     = {text = "Apache-2.0"}
 description = "A simple library to interface with iAlarm systems, built for use with Home-Assistant"
 readme      = "README.md"
 authors     = [
-    {name = "Ludovico de Nittis", email = "aasonykk+pyasyncialarm@gmail.com"}
+    {name = "Fabio Bigmoby Mauro", email = "[EMAIL_ADDRESS]"}
 ]
 keywords    = ["ialarm", "antifurtocasa365", "alarm"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.14",
     "License :: OSI Approved :: MIT License",
     "License :: OSI Approved :: Apache Software License",
     "Topic :: Software Development :: Libraries",
 ]
-requires-python = ">=3.11.0"
+requires-python = ">=3.14.0"
 dependencies = [
     "dicttoxml2",
     "xmltodict",
@@ -38,7 +38,7 @@ zip-safe  = false
 include-package-data = true
 
 [tool.pylint.MAIN]
-py-version = "3.11"
+py-version = "3.14"
 ignore = [
     "tests",
 ]
@@ -650,6 +650,7 @@ ignore = [
     # "SIM102", # Use a single if statement instead of nested if statements
     # "SIM108", # Use ternary operator {contents} instead of if-else-block
     "SIM115", # Use context handler for opening files
+    "SIM117", # Use a single `with` statement with multiple contexts instead of nested `with` statements
     # "TRY003", # Avoid specifying long messages outside the exception class
     "TRY400", # Use `logging.exception` instead of `logging.error`
     "UP006", # keep type annotation style as is
@@ -681,6 +682,7 @@ ignore = [
     "RET502",
     "RET501",
     "TRY002",
+    "TRY003",
     "TRY301"
 ]
 
@@ -703,7 +705,7 @@ max-complexity = 25
 # mypy global options:
 
 [tool.mypy]
-python_version = 3.12
+python_version = 3.14
 plugins = "pydantic.mypy"
 namespace_packages = true
 pretty = true

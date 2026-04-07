@@ -50,6 +50,7 @@ class IAlarm:
         self.port = port
         self.seq = 0
         self.sock = None
+        self._lock = asyncio.Lock()
 
     def _is_socket_open(self) -> bool:
         return self.sock is not None and self.sock.fileno() != -1
@@ -81,84 +82,177 @@ class IAlarm:
         if self.sock and self.sock.fileno() != -1:
             self.sock.close()
 
-    def _truncate_bytes(self, buffer: bytes, sequence=b"FFFF"):
-        pos = buffer.find(sequence)
-        if pos != -1:
-            log.debug("Trigger message will be truncated")
-            return buffer[:pos]
-        return buffer
+    async def shutdown(self) -> None:
+        """Close the socket cleanly. Call this when HA stops."""
+        self._close_connection()
 
-    def _check_and_trim_trigger_response(self, buffer: bytes) -> bytes:
-        start_delimiter_trigger = b"@alA0"
-        if buffer.startswith(start_delimiter_trigger):
-            log.debug("It's a trigger message...")
-            return self._truncate_bytes(buffer)
-        return buffer
+    # ------------------------------------------------------------------
+    # Frame detection helpers
+    # ------------------------------------------------------------------
 
-    def _is_complete_message(self, buffer: bytes) -> bool:
-        """Check if the buffer contains a complete message based on the delimiters."""
+    def _is_trigger_frame(self, buffer: bytes) -> bool:
+        """Return True if the buffer starts with an alarm-trigger frame."""
+        return buffer.startswith(b"@alA0")
 
-        start_delimiter_type_standard = b"@ieM"
-        start_delimiter_type_list_2 = b"@ieM02"
-        start_delimiter_type_list_3 = b"@ieM03"
-        start_delimiter_type_list_4 = b"@ieM04"
-        start_delimiter_trigger = b"@alA0"
-        # end_delimiter_standard = b"0001"
-        end_delimiter_trigger = b"FFFF"
+    def _is_standard_frame(self, buffer: bytes) -> bool:
+        """Return True if the buffer starts with a standard @ieM frame."""
+        return buffer.startswith(b"@ieM")
 
-        if buffer.startswith(start_delimiter_trigger):
-            return buffer.endswith(end_delimiter_trigger)
+    def _trigger_frame_complete(self, buffer: bytes) -> bool:
+        """Return True when the buffer contains a complete trigger frame (ends with FFFF)."""
+        return b"FFFF" in buffer
 
-        if buffer.startswith(
-            (
-                start_delimiter_type_standard,
-                start_delimiter_type_list_2,
-                start_delimiter_type_list_3,
-                start_delimiter_type_list_4,
-            )
-        ):
-            return len(buffer) >= 4 and buffer[-4:].isdigit()
+    def _standard_frame_complete(self, buffer: bytes) -> bool:
+        """Return True when the buffer contains a complete standard @ieM frame.
 
+        A complete frame ends with a 4-digit decimal sequence number that
+        matches the one in the header.
+
+        Frame layout:
+          @ieM<len:4><seq:4>0000<XOR(payload)><seq:4>
+          0    4      8     12   16            16+len
+          ← ──────── 16 bytes header ────────→
+
+        Total expected size = 16 (header) + len + 4 (trailing seq)
+        """
+        if len(buffer) < 16:
+            return False
+        try:
+            msg_len = int(buffer[4:8])
+        except ValueError:
+            return False
+        expected_total = 16 + msg_len + 4
+        if len(buffer) < expected_total:
+            return False
+        # Verify the trailing seq matches the header seq
+        header_seq = buffer[8:12]
+        trailing_seq = buffer[expected_total - 4 : expected_total]
+        return header_seq == trailing_seq
+
+    def _frame_complete(self, buffer: bytes) -> bool:
+        """Check whether the accumulated buffer contains a complete frame."""
+        if not buffer:
+            return False
+        if self._is_trigger_frame(buffer):
+            return self._trigger_frame_complete(buffer)
+        if self._is_standard_frame(buffer):
+            return self._standard_frame_complete(buffer)
         return False
 
-    def __raise_connection_error(self, msg: str):
-        """Close the connection and raises a connection error."""
-        self._close_connection()
-        raise ConnectionError(msg)
+    def _strip_leading_trigger_frames(self, buffer: bytes) -> bytes:
+        """When the alarm is sounding the centralina may send one or more
+        unsolicited trigger frames (@alA0...FFFF) before or interleaved
+        with the actual command response.
+
+        This method discards all leading trigger frames so that
+        _extract_payload can work on a clean @ieM frame.
+        """
+        while buffer.startswith(b"@alA0"):
+            ffff_pos = buffer.find(b"FFFF")
+            if ffff_pos == -1:
+                # Trigger frame not yet complete — caller should read more data
+                log.debug("Incomplete trigger frame in buffer, need more data")
+                return buffer
+            end = ffff_pos + 4
+            log.debug("Discarding trigger frame of %d bytes", end)
+            buffer = buffer[end:]
+            # Skip any whitespace / null bytes between frames
+            buffer = buffer.lstrip(b"\x00")
+        return buffer
+
+    # ------------------------------------------------------------------
+    # Payload extraction
+    # ------------------------------------------------------------------
+
+    def _extract_payload(self, buffer: bytes) -> bytes:
+        """Extract the XOR-obfuscated payload from a complete @ieM frame.
+
+        Frame layout:
+          @ieM<len:4><seq:4>0000  → 16 bytes header
+          <XOR(payload)>          → len bytes
+          <seq:4>                 → 4 bytes trailer
+        """
+        try:
+            msg_len = int(buffer[4:8])
+        except ValueError as e:
+            raise ConnectionError(
+                f"Cannot parse frame length from buffer: {buffer[:16]!r}"
+            ) from e
+        return buffer[16 : 16 + msg_len]
+
+    # ------------------------------------------------------------------
+    # Core receive loop
+    # ------------------------------------------------------------------
 
     async def _receive(self):
-        """Receive and decode the message from the socket."""
+        """Receive a complete frame from the socket, accumulating chunks
+        until the frame is complete.
 
+        Key improvements over the previous single-recv approach:
+        - Accumulates data across multiple recv() calls (TCP fragmentation)
+        - Discards unsolicited trigger frames (@alA0...FFFF) that arrive
+          while the alarm is sounding, before or mixed with the response
+        - Validates frame length from the header rather than relying on
+          heuristics like buffer[-4:].isdigit()
+        """
         try:
-            buffer = b""
             await self.ensure_connection_is_open()
-            log.debug("Attempting to receive data from the socket...")
-
             loop = asyncio.get_running_loop()
+            buffer = b""
+            deadline = loop.time() + SOCKET_TIMEOUT
 
-            try:
-                buffer = await asyncio.wait_for(
-                    loop.sock_recv(self.sock, RECV_BUF_SIZE), timeout=SOCKET_TIMEOUT
-                )
-            except TimeoutError:
-                self.__raise_connection_error("Socket timeout: no data received.")
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    self.__raise_connection_error(
+                        "Socket timeout: no complete frame received within "
+                        f"{SOCKET_TIMEOUT}s. Buffer so far: {buffer[:64]!r}"
+                    )
 
-            if not buffer:
-                self.__raise_connection_error("Connection error: received no data.")
+                try:
+                    chunk = await asyncio.wait_for(
+                        loop.sock_recv(self.sock, RECV_BUF_SIZE),
+                        timeout=remaining,
+                    )
+                except TimeoutError:
+                    self.__raise_connection_error(
+                        "Socket timeout: no complete frame received within "
+                        f"{SOCKET_TIMEOUT}s. Buffer so far: {buffer[:64]!r}"
+                    )
 
-            log.debug("Received buffer of size %d", len(buffer))
+                if not chunk:
+                    self.__raise_connection_error(
+                        "Connection closed by remote host while receiving frame."
+                    )
 
-            if not self._is_complete_message(buffer):
-                self.__raise_connection_error(
-                    f"Connection error: incomplete message received. {buffer}"
-                )
+                buffer += chunk
+                log.debug("Accumulated %d bytes (chunk: %d)", len(buffer), len(chunk))
 
-            log.debug("Extracting payload from buffer of size %d", len(buffer))
+                # Discard leading trigger frames so we can assess the
+                # real response underneath.
+                buffer = self._strip_leading_trigger_frames(buffer)
 
-            log.debug("Preprocess trigger messages if any...")
-            buffer = self._check_and_trim_trigger_response(buffer)
+                if not buffer:
+                    # Everything received so far was trigger frames;
+                    # keep reading until we get the actual response.
+                    log.debug(
+                        "Buffer empty after stripping trigger frames, reading more"
+                    )
+                    continue
 
-            payload = buffer[16:-4]
+                if not self._is_standard_frame(buffer):
+                    # Unexpected frame start — log and bail out
+                    self.__raise_connection_error(
+                        f"Unexpected frame start: {buffer[:16]!r}"
+                    )
+
+                if self._standard_frame_complete(buffer):
+                    log.debug("Complete @ieM frame received (%d bytes)", len(buffer))
+                    break
+
+                log.debug("Frame incomplete, reading more data...")
+
+            payload = self._extract_payload(buffer)
 
             decoded = (
                 self._xor(payload)
@@ -170,7 +264,7 @@ class IAlarm:
 
             if not decoded:
                 self.__raise_connection_error(
-                    "Connection error: unexpected empty reply."
+                    "Connection error: unexpected empty reply after XOR decode."
                 )
 
             return await self._parse_decoded_message(decoded)
@@ -200,6 +294,26 @@ class IAlarm:
             log.error("Tried to decode [%s]", decoded)
             self.__raise_connection_error("Received malformed XML response")
 
+    def __raise_connection_error(self, msg: str):
+        """Close the connection and raises a connection error."""
+        self._close_connection()
+        raise ConnectionError(msg)
+
+    # ------------------------------------------------------------------
+    # Send helpers
+    # ------------------------------------------------------------------
+
+    async def _send_dict(self, root_dict) -> None:
+        xml = dicttoxml2.dicttoxml(root_dict, attr_type=False, root=False)
+
+        await self.ensure_connection_is_open()
+
+        self.seq += 1
+        msg = b"@ieM%04d%04d0000%s%04d" % (len(xml), self.seq, self._xor(xml), self.seq)
+
+        loop = asyncio.get_running_loop()
+        await loop.sock_sendall(self.sock, msg)
+
     async def _send_request_list(
         self,
         xpath: str,
@@ -207,6 +321,14 @@ class IAlarm:
         offset: int = 0,
         partial_list: list[Any] | None = None,
     ) -> list[Any]:
+        """Send a paginated list request.
+
+        Must be called from within an acquired self._lock context,
+        with an open connection already established.
+        Pagination is handled internally via recursion without reopening
+        the socket between pages.
+        Does NOT close the connection — the caller is responsible for that.
+        """
         if offset > 0:
             command["Offset"] = f"S32,0,0|{offset}"
         root_dict: dict[str, Any] = self._create_root_dict(xpath, command)
@@ -225,14 +347,36 @@ class IAlarm:
 
         return partial_list
 
+    async def _send_request_list_locked(
+        self,
+        xpath: str,
+        command: OrderedDict[str, Any | None],
+    ) -> list[Any]:
+        """Acquire the lock, open a fresh connection, run a full paginated
+        list request, then close the connection regardless of outcome.
+        """
+        async with self._lock:
+            try:
+                await self.ensure_connection_is_open(force_reconnect=True)
+                return await self._send_request_list(xpath, command)
+            finally:
+                self._close_connection()
+
     async def _send_request(
         self, xpath: str, command: OrderedDict[str, Any | None]
     ) -> dict[str, Any]:
-        root_dict = self._create_root_dict(xpath, command)
-        await self._send_dict(root_dict)
-        response = await self._receive()
-        self._close_connection()
-        return self._clean_response_dict(response, xpath)
+        """Acquire the lock, send a single request and return the parsed response."""
+        async with self._lock:
+            await self.ensure_connection_is_open(force_reconnect=True)
+            root_dict = self._create_root_dict(xpath, command)
+            await self._send_dict(root_dict)
+            response = await self._receive()
+            self._close_connection()
+            return self._clean_response_dict(response, xpath)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     async def get_mac(self) -> str:
         mac = ""
@@ -265,22 +409,45 @@ class IAlarm:
         return log_list[:max_entries]
 
     async def get_zone_status(self) -> list[ZoneStatusType]:
-        zones: list[ZoneType] = await self.get_zone()
+        """Fetch zone names and zone status in a single locked TCP session.
 
-        zone_name_map = {zone["zone_id"]: zone["name"] for zone in zones}
+        Previously this called get_zone() and GetByWay in two separate
+        sessions, leaving the socket in an inconsistent state between them.
+        Now both paginated requests share one connection under one lock
+        acquisition, which also halves the number of TCP handshakes.
+        """
+        zone_command: OrderedDict[str, Any | None] = OrderedDict()
+        zone_command["Total"] = None
+        zone_command["Offset"] = "S32,0,0|0"
+        zone_command["Ln"] = None
+        zone_command["Err"] = None
 
-        command: OrderedDict[str, Any | None] = OrderedDict()
-        command["Total"] = None
-        command["Offset"] = "S32,0,0|0"
-        command["Ln"] = None
-        command["Err"] = None
-        zone_status: list[int] = await self._send_request_list(
-            "/Root/Host/GetByWay", command
-        )
+        status_command: OrderedDict[str, Any | None] = OrderedDict()
+        status_command["Total"] = None
+        status_command["Offset"] = "S32,0,0|0"
+        status_command["Ln"] = None
+        status_command["Err"] = None
+
+        async with self._lock:
+            try:
+                await self.ensure_connection_is_open(force_reconnect=True)
+                raw_zone_data: list[ZoneTypeRaw] = await self._send_request_list(
+                    "/Root/Host/GetZone", zone_command
+                )
+                zone_status: list[int] = await self._send_request_list(
+                    "/Root/Host/GetByWay", status_command
+                )
+            finally:
+                self._close_connection()
+
+        zone_name_map = {
+            i + 1: decode_name(zone["Name"]) for i, zone in enumerate(raw_zone_data)
+        }
 
         if zone_status is None:
-            error_message = "An error occurred trying to connect to the alarm system"
-            raise ConnectionError(error_message)
+            raise ConnectionError(
+                "An error occurred trying to connect to the alarm system"
+            )
 
         result = []
         for i, status in enumerate(zone_status):
@@ -304,11 +471,9 @@ class IAlarm:
             if not status_list:
                 status_list.append(StatusType.ZONE_NOT_USED)
 
-            zone_name = zone_name_map.get(zone_id, "Unknown")
-
             zone_item: ZoneStatusType = {
                 "zone_id": zone_id,
-                "name": zone_name,
+                "name": zone_name_map.get(zone_id, "Unknown"),
                 "types": status_list,
             }
             result.append(zone_item)
@@ -370,7 +535,7 @@ class IAlarm:
         command["Ln"] = None
         command["Err"] = None
 
-        event_log_raw: list[LogEntryTypeRaw] = await self._send_request_list(
+        event_log_raw: list[LogEntryTypeRaw] = await self._send_request_list_locked(
             "/Root/Host/GetLog", command
         )
 
@@ -405,7 +570,7 @@ class IAlarm:
         command["Ln"] = None
         command["Err"] = None
 
-        raw_zone_data: list[ZoneTypeRaw] = await self._send_request_list(
+        raw_zone_data: list[ZoneTypeRaw] = await self._send_request_list_locked(
             "/Root/Host/GetZone", command
         )
         zone: list[ZoneType] = self.__extract_zones(raw_zone_data)
@@ -419,7 +584,7 @@ class IAlarm:
         command["Ln"] = None
         command["Err"] = None
 
-        zone_type_codes = await self._send_request_list(
+        zone_type_codes = await self._send_request_list_locked(
             "/Root/Host/GetZoneType", command
         )
         zone_types = [
@@ -435,7 +600,7 @@ class IAlarm:
         command["Ln"] = None
         command["Err"] = None
 
-        alarm_type_codes = await self._send_request_list(
+        alarm_type_codes = await self._send_request_list_locked(
             "/Root/Host/GetVoiceType", command
         )
         zone_types = [
@@ -469,16 +634,9 @@ class IAlarm:
         command["Err"] = None
         await self._send_request("/Root/Host/SetAlarmStatus", command)
 
-    async def _send_dict(self, root_dict) -> None:
-        xml = dicttoxml2.dicttoxml(root_dict, attr_type=False, root=False)
-
-        await self.ensure_connection_is_open()
-
-        self.seq += 1
-        msg = b"@ieM%04d%04d0000%s%04d" % (len(xml), self.seq, self._xor(xml), self.seq)
-
-        loop = asyncio.get_running_loop()
-        await loop.sock_sendall(self.sock, msg)
+    # ------------------------------------------------------------------
+    # Static helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _xmlread(_path, key, value):
