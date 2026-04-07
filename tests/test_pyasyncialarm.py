@@ -203,11 +203,11 @@ async def test_get_zone_status_success(ialarm):
 
 @pytest.mark.asyncio
 async def test_get_zone_status_no_zones(ialarm):
-    ialarm.get_zone = AsyncMock(return_value=[])
-
     ialarm._send_request_list = AsyncMock(return_value=[])
 
-    result = await ialarm.get_zone_status()
+    with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
+        with patch.object(ialarm, "_close_connection"):
+            result = await ialarm.get_zone_status()
     assert result == []
 
 
@@ -266,8 +266,10 @@ async def test_get_log():
     event_type_map = {"001": "Event One", "002": "Event Two"}
 
     with (
+        # Patch _send_request_list_locked to bypass ensure_connection_is_open
+        # which would try a real TCP connect and hang on CI.
         patch.object(
-            IAlarm, "_send_request_list", AsyncMock(return_value=event_log_raw)
+            IAlarm, "_send_request_list_locked", AsyncMock(return_value=event_log_raw)
         ),
         patch("pyasyncialarm.const.EVENT_TYPE_MAP", event_type_map),
     ):
@@ -339,20 +341,22 @@ async def test_get_zone(ialarm):
         {"Type": 2, "Voice": 1, "Name": "GBA,8|5A6F6E65", "Bell": "BOL|F"},
     ]
 
-    with patch.object(
-        ialarm, "_send_request_list", new_callable=AsyncMock
-    ) as mock_send:
-        mock_send.return_value = mock_zone_data
+    with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
+        with patch.object(ialarm, "_close_connection"):
+            with patch.object(
+                ialarm, "_send_request_list", new_callable=AsyncMock
+            ) as mock_send:
+                mock_send.return_value = mock_zone_data
 
-        zones = await ialarm.get_zone()
+                zones = await ialarm.get_zone()
 
-        mock_send.assert_awaited_once()
-        assert len(zones) == 2
-        assert zones[0]["zone_id"] == 1
-        assert zones[0]["name"] == "Zone"  # Decoded from hex
-        assert zones[0]["bell"] is True
-        assert zones[1]["zone_id"] == 2
-        assert zones[1]["bell"] is False
+                mock_send.assert_awaited_once()
+    assert len(zones) == 2
+    assert zones[0]["zone_id"] == 1
+    assert zones[0]["name"] == "Zone"  # Decoded from hex
+    assert zones[0]["bell"] is True
+    assert zones[1]["zone_id"] == 2
+    assert zones[1]["bell"] is False
 
 
 @pytest.mark.asyncio
@@ -360,19 +364,21 @@ async def test_get_zone_type(ialarm):
     """Test retrieving zone types."""
     mock_zone_types = ["SI", "IN", "NO", "DE"]
 
-    with patch.object(
-        ialarm, "_send_request_list", new_callable=AsyncMock
-    ) as mock_send:
-        mock_send.return_value = mock_zone_types
+    with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
+        with patch.object(ialarm, "_close_connection"):
+            with patch.object(
+                ialarm, "_send_request_list", new_callable=AsyncMock
+            ) as mock_send:
+                mock_send.return_value = mock_zone_types
 
-        zone_types = await ialarm.get_zone_type()
+                zone_types = await ialarm.get_zone_type()
 
-        mock_send.assert_awaited_once()
-        assert len(zone_types) == 4
-        assert zone_types[0].value == "Perimeter"  # SI
-        assert zone_types[1].value == "Inner"  # IN
-        assert zone_types[2].value == "Unused"  # NO
-        assert zone_types[3].value == "Delay"  # DE
+                mock_send.assert_awaited_once()
+    assert len(zone_types) == 4
+    assert zone_types[0].value == "Perimeter"  # SI
+    assert zone_types[1].value == "Inner"  # IN
+    assert zone_types[2].value == "Unused"  # NO
+    assert zone_types[3].value == "Delay"  # DE
 
 
 @pytest.mark.asyncio
@@ -380,18 +386,20 @@ async def test_get_alarm_type(ialarm):
     """Test retrieving alarm/siren types."""
     mock_alarm_types = ["CX", "MC", "NO"]
 
-    with patch.object(
-        ialarm, "_send_request_list", new_callable=AsyncMock
-    ) as mock_send:
-        mock_send.return_value = mock_alarm_types
+    with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
+        with patch.object(ialarm, "_close_connection"):
+            with patch.object(
+                ialarm, "_send_request_list", new_callable=AsyncMock
+            ) as mock_send:
+                mock_send.return_value = mock_alarm_types
 
-        alarm_types = await ialarm.get_alarm_type()
+                alarm_types = await ialarm.get_alarm_type()
 
-        mock_send.assert_awaited_once()
-        assert len(alarm_types) == 3
-        assert alarm_types[0].value == "Continued"  # CX
-        assert alarm_types[1].value == "Pulsed"  # MC
-        assert alarm_types[2].value == "Mute"  # NO
+                mock_send.assert_awaited_once()
+    assert len(alarm_types) == 3
+    assert alarm_types[0].value == "Continued"  # CX
+    assert alarm_types[1].value == "Pulsed"  # MC
+    assert alarm_types[2].value == "Mute"  # NO
 
 
 def test_parse_time_valid():
