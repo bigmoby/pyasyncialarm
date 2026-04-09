@@ -125,19 +125,6 @@ class SirenSoundTypeEnum(str, Enum):
     MUTE = "Mute"
 
 
-TYPE_MAPPING = {
-    0: ZoneTypeEnum.UNUSED,
-    1: ZoneTypeEnum.DELAY,
-    2: ZoneTypeEnum.PERIMETER,
-    3: ZoneTypeEnum.INNER,
-    4: ZoneTypeEnum.EMERGENCY,
-    5: ZoneTypeEnum.HOUR_24,
-    6: ZoneTypeEnum.FIRE,
-    7: ZoneTypeEnum.KEY,
-    8: ZoneTypeEnum.GAS,
-    9: ZoneTypeEnum.WATER,
-}
-
 ZONE_TYPE_MAP = {
     "NO": ZoneTypeEnum.UNUSED,
     "DE": ZoneTypeEnum.DELAY,

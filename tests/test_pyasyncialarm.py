@@ -7,7 +7,7 @@ import xml.parsers.expat
 import pytest
 
 from pyasyncialarm.const import StatusType
-from pyasyncialarm.exception import IAlarmConnectionError, IAlarmSocketNotOpenError
+from pyasyncialarm.exception import IAlarmConnectionError
 from pyasyncialarm.pyasyncialarm import IAlarm
 from pyasyncialarm.util import decode_name, parse_bell, parse_time
 
@@ -312,7 +312,8 @@ async def test_arm_stay(ialarm):
 @pytest.mark.asyncio
 async def test_disarm(ialarm):
     """Test disarming the alarm."""
-    with patch.object(ialarm, "_send_request", new_callable=AsyncMock) as mock_send:
+    with patch.object(ialarm, "_send_request_raw", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = {"DevStatus": "1"}
         await ialarm.disarm()
 
         mock_send.assert_awaited_once()
@@ -324,7 +325,8 @@ async def test_disarm(ialarm):
 @pytest.mark.asyncio
 async def test_cancel_alarm(ialarm):
     """Test canceling an active alarm."""
-    with patch.object(ialarm, "_send_request", new_callable=AsyncMock) as mock_send:
+    with patch.object(ialarm, "_send_request_raw", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = {"DevStatus": "3"}
         await ialarm.cancel_alarm()
 
         mock_send.assert_awaited_once()
@@ -334,7 +336,7 @@ async def test_cancel_alarm(ialarm):
 
 
 @pytest.mark.asyncio
-async def test_get_zone(ialarm):
+async def test__get_zone(ialarm):
     """Test retrieving zone configuration."""
     mock_zone_data = [
         {"Type": 1, "Voice": 0, "Name": "GBA,8|5A6F6E65", "Bell": "BOL|T"},
@@ -348,7 +350,7 @@ async def test_get_zone(ialarm):
             ) as mock_send:
                 mock_send.return_value = mock_zone_data
 
-                zones = await ialarm.get_zone()
+                zones = await ialarm._get_zone()
 
                 mock_send.assert_awaited_once()
     assert len(zones) == 2
@@ -1081,14 +1083,6 @@ async def test_get_zone_status_low_battery_and_loss(ialarm):
     assert StatusType.ZONE_LOSS in result[0]["types"]
 
 
-def test_exception_ialarm_socket_not_open_error():
-    """Test IAlarmSocketNotOpenError exception."""
-
-    error = IAlarmSocketNotOpenError()
-    assert str(error) == "Socket is not open"
-    assert isinstance(error, ConnectionError)
-
-
 def test_exception_ialarm_connection_error():
     """Test IAlarmConnectionError exception."""
 
@@ -1217,3 +1211,183 @@ async def test_receive_incomplete_message(ialarm):
 
             with pytest.raises(ConnectionError, match="Socket timeout"):
                 await ialarm._receive()
+
+
+@pytest.mark.asyncio
+async def test_send_request_raw_returns_subtree(ialarm):
+    """Test _send_request_raw returns the xpath subtree dict."""
+    command = {"DevStatus": "TYP,DISARM|1", "Err": None}
+
+    with (
+        patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock),
+        patch.object(ialarm, "_send_dict", new_callable=AsyncMock),
+        patch.object(ialarm, "_receive", new_callable=AsyncMock) as mock_receive,
+        patch.object(ialarm, "_close_connection"),
+    ):
+        mock_receive.return_value = {
+            "Root": {"Host": {"SetAlarmStatus": {"DevStatus": 1, "Err": 0}}}
+        }
+
+        result = await ialarm._send_request_raw("/Root/Host/SetAlarmStatus", command)
+
+        assert result == {"DevStatus": 1, "Err": 0}
+
+
+@pytest.mark.asyncio
+async def test_send_request_raw_returns_empty_on_none(ialarm):
+    """Test _send_request_raw returns empty dict when subtree is None."""
+    command = {"DevStatus": "TYP,DISARM|1", "Err": None}
+
+    with (
+        patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock),
+        patch.object(ialarm, "_send_dict", new_callable=AsyncMock),
+        patch.object(ialarm, "_receive", new_callable=AsyncMock) as mock_receive,
+        patch.object(ialarm, "_close_connection"),
+    ):
+        mock_receive.return_value = {"Root": {"Host": {}}}
+
+        result = await ialarm._send_request_raw("/Root/Host/SetAlarmStatus", command)
+
+        assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_disarm_returns_dev_status(ialarm):
+    """Test disarm() returns the DevStatus integer from the panel response."""
+    with patch.object(ialarm, "_send_request_raw", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = {"DevStatus": 1, "Err": 0}
+
+        result = await ialarm.disarm()
+
+        assert result == 1
+
+
+@pytest.mark.asyncio
+async def test_disarm_returns_minus_one_on_missing_status(ialarm):
+    """Test disarm() returns -1 when DevStatus is absent from response."""
+    with patch.object(ialarm, "_send_request_raw", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = {}
+
+        result = await ialarm.disarm()
+
+        assert result == -1
+
+
+@pytest.mark.asyncio
+async def test_cancel_alarm_returns_dev_status(ialarm):
+    """Test cancel_alarm() returns the DevStatus integer from the panel response."""
+    with patch.object(ialarm, "_send_request_raw", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = {"DevStatus": 3, "Err": 0}
+
+        result = await ialarm.cancel_alarm()
+
+        assert result == 3
+
+
+@pytest.mark.asyncio
+async def test_disarm_and_cancel_already_disarmed(ialarm):
+    """Test disarm_and_cancel returns True immediately when disarm response
+    shows the panel is already in DISARMED state (no cancel needed).
+    """
+    with patch.object(ialarm, "disarm", new_callable=AsyncMock) as mock_disarm:
+        mock_disarm.return_value = ialarm.DISARMED
+
+        with patch.object(
+            ialarm, "cancel_alarm", new_callable=AsyncMock
+        ) as mock_cancel:
+            result = await ialarm.disarm_and_cancel()
+
+            assert result is True
+            mock_disarm.assert_awaited_once()
+            mock_cancel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_disarm_and_cancel_cancel_state_immediate(ialarm):
+    """Test disarm_and_cancel returns True immediately when disarm response
+    shows the panel is in CANCEL state.
+    """
+    with patch.object(ialarm, "disarm", new_callable=AsyncMock) as mock_disarm:
+        mock_disarm.return_value = ialarm.CANCEL
+
+        with patch.object(
+            ialarm, "cancel_alarm", new_callable=AsyncMock
+        ) as mock_cancel:
+            result = await ialarm.disarm_and_cancel()
+
+            assert result is True
+            mock_cancel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_disarm_and_cancel_triggered_then_cleared(ialarm):
+    """Test disarm_and_cancel retries cancel until the panel confirms disarmed."""
+    with patch.object(ialarm, "disarm", new_callable=AsyncMock) as mock_disarm:
+        mock_disarm.return_value = ialarm.TRIGGERED
+
+        with patch.object(
+            ialarm, "cancel_alarm", new_callable=AsyncMock
+        ) as mock_cancel:
+            mock_cancel.side_effect = [ialarm.TRIGGERED, ialarm.DISARMED]
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                result = await ialarm.disarm_and_cancel(max_attempts=3, retry_delay=1.0)
+
+            assert result is True
+            assert mock_cancel.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_disarm_and_cancel_max_retries_exhausted(ialarm):
+    """Test disarm_and_cancel returns False after exhausting all cancel attempts."""
+    with patch.object(ialarm, "disarm", new_callable=AsyncMock) as mock_disarm:
+        mock_disarm.return_value = ialarm.TRIGGERED
+
+        with patch.object(
+            ialarm, "cancel_alarm", new_callable=AsyncMock
+        ) as mock_cancel:
+            mock_cancel.return_value = ialarm.TRIGGERED
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                result = await ialarm.disarm_and_cancel(max_attempts=3, retry_delay=1.0)
+
+            assert result is False
+            assert mock_cancel.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_disarm_and_cancel_unknown_status_retries(ialarm):
+    """Test disarm_and_cancel retries when disarm returns unknown status (-1)."""
+    with patch.object(ialarm, "disarm", new_callable=AsyncMock) as mock_disarm:
+        mock_disarm.return_value = -1
+
+        with patch.object(
+            ialarm, "cancel_alarm", new_callable=AsyncMock
+        ) as mock_cancel:
+            mock_cancel.return_value = ialarm.DISARMED
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                result = await ialarm.disarm_and_cancel(max_attempts=3, retry_delay=1.0)
+
+            assert result is True
+            assert mock_cancel.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_disarm_and_cancel_custom_params(ialarm):
+    """Test disarm_and_cancel respects custom max_attempts and retry_delay."""
+    with patch.object(ialarm, "disarm", new_callable=AsyncMock) as mock_disarm:
+        mock_disarm.return_value = ialarm.TRIGGERED
+
+        with patch.object(
+            ialarm, "cancel_alarm", new_callable=AsyncMock
+        ) as mock_cancel:
+            mock_cancel.return_value = ialarm.TRIGGERED
+
+            with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                result = await ialarm.disarm_and_cancel(max_attempts=5, retry_delay=2.0)
+
+            assert result is False
+            assert mock_cancel.await_count == 5
+            assert mock_sleep.await_count == 5
+            mock_sleep.assert_awaited_with(2.0)

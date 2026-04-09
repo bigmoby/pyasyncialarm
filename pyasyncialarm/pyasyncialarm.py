@@ -32,6 +32,14 @@ log = logging.getLogger(__name__)
 # dicttoxml is very verbose at INFO level
 logging.getLogger("dicttoxml").setLevel(logging.CRITICAL)
 
+# Pre-compiled regex patterns used by _xmlread to parse iAlarm XML value tokens.
+# Compiled once at module load to avoid repeated re.compile() on every XML node.
+_RE_ERR = re.compile(r"ERR\|(\d{2})")
+_RE_MAC = re.compile(r"MAC,(\d+)\|(([0-9A-F]{2}[:-]){5}([0-9A-F]{2}))")
+_RE_S32 = re.compile(r"S32,(\d+),(\d+)\|(\d*)")
+_RE_STR = re.compile(r"STR,(\d+)\|(.*)")
+_RE_TYP = re.compile(r"TYP,(\w+)\|(\d+)")
+
 
 class IAlarm:
     """Interface the iAlarm security systems."""
@@ -374,6 +382,23 @@ class IAlarm:
             self._close_connection()
             return self._clean_response_dict(response, xpath)
 
+    async def _send_request_raw(
+        self, xpath: str, command: OrderedDict[str, Any | None]
+    ) -> dict[str, Any]:
+        """Like _send_request but returns the full parsed response dict.
+
+        Use this when the caller needs to inspect fields beyond the xpath
+        subtree — for example reading both Err and DevStatus from a
+        SetAlarmStatus response.
+        """
+        async with self._lock:
+            await self.ensure_connection_is_open(force_reconnect=True)
+            root_dict = self._create_root_dict(xpath, command)
+            await self._send_dict(root_dict)
+            response = await self._receive()
+            self._close_connection()
+            return self._clean_response_dict(response, xpath) or {}
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -563,7 +588,12 @@ class IAlarm:
             for i, zone in enumerate(zone_data_raw, start=1)
         ]
 
-    async def get_zone(self) -> list[ZoneType]:
+    async def _get_zone(self) -> list[ZoneType]:
+        """Fetch zone definitions (name, type, bell) from the alarm panel.
+
+        Internal use only — called within get_zone_status() under the lock.
+        External callers should use get_zone_status() instead.
+        """
         command: OrderedDict[str, Any | None] = OrderedDict()
         command["Total"] = None
         command["Offset"] = "S32,0,0|0"
@@ -611,28 +641,101 @@ class IAlarm:
         return zone_types
 
     async def arm_away(self) -> None:
+        """Arm the alarm system in away mode."""
         command: OrderedDict[str, Any | None] = OrderedDict()
         command["DevStatus"] = "TYP,ARM|0"
         command["Err"] = None
         await self._send_request("/Root/Host/SetAlarmStatus", command)
 
     async def arm_stay(self) -> None:
+        """Arm the alarm system in stay (home) mode."""
         command: OrderedDict[str, Any | None] = OrderedDict()
         command["DevStatus"] = "TYP,STAY|2"
         command["Err"] = None
         await self._send_request("/Root/Host/SetAlarmStatus", command)
 
-    async def disarm(self) -> None:
+    async def disarm(self) -> int:
+        """Send the disarm command and return the DevStatus from the response.
+
+        Returns:
+            The DevStatus integer returned by the panel (0=armed away,
+            1=disarmed, 2=armed stay, 3=cancel, 4=triggered).
+            Returns -1 if the panel did not return a valid status.
+
+        """
         command: OrderedDict[str, Any | None] = OrderedDict()
         command["DevStatus"] = "TYP,DISARM|1"
         command["Err"] = None
-        await self._send_request("/Root/Host/SetAlarmStatus", command)
+        response = await self._send_request_raw("/Root/Host/SetAlarmStatus", command)
+        return int(response.get("DevStatus", -1))
 
-    async def cancel_alarm(self) -> None:
+    async def cancel_alarm(self) -> int:
+        """Send the cancel/clear command and return the DevStatus from the response.
+
+        Returns:
+            The DevStatus integer returned by the panel.
+            Returns -1 if the panel did not return a valid status.
+
+        """
         command: OrderedDict[str, Any | None] = OrderedDict()
         command["DevStatus"] = "TYP,CLEAR|3"
         command["Err"] = None
-        await self._send_request("/Root/Host/SetAlarmStatus", command)
+        response = await self._send_request_raw("/Root/Host/SetAlarmStatus", command)
+        return int(response.get("DevStatus", -1))
+
+    async def disarm_and_cancel(
+        self,
+        max_attempts: int = 3,
+        retry_delay: float = 1.0,
+    ) -> bool:
+        """Disarm the panel and ensure any active alarm is cleared.
+
+        This is the recommended method to call when the alarm is sounding.
+        It sends a disarm command, reads the DevStatus from the response,
+        and if the panel is still in a triggered state it retries cancel_alarm
+        up to max_attempts times with retry_delay seconds between each attempt.
+
+        Args:
+            max_attempts: Maximum number of cancel_alarm attempts after disarm.
+            retry_delay:  Seconds to wait between cancel attempts.
+
+        Returns:
+            True if the panel confirmed a non-triggered state within the
+            allowed attempts, False if it remained triggered after all retries.
+
+        """
+        log.debug("disarm_and_cancel: sending disarm")
+        dev_status = await self.disarm()
+        log.debug("disarm_and_cancel: disarm response DevStatus=%s", dev_status)
+
+        if dev_status in {self.DISARMED, self.CANCEL}:
+            log.debug("disarm_and_cancel: panel already disarmed, no cancel needed")
+            return True
+
+        for attempt in range(1, max_attempts + 1):
+            log.debug(
+                "disarm_and_cancel: cancel attempt %d/%d (DevStatus=%s)",
+                attempt,
+                max_attempts,
+                dev_status,
+            )
+            await asyncio.sleep(retry_delay)
+            dev_status = await self.cancel_alarm()
+            log.debug(
+                "disarm_and_cancel: cancel attempt %d response DevStatus=%s",
+                attempt,
+                dev_status,
+            )
+            if dev_status in {self.DISARMED, self.CANCEL}:
+                log.debug("disarm_and_cancel: panel confirmed disarmed")
+                return True
+
+        log.warning(
+            "disarm_and_cancel: panel still in status %s after %d attempts",
+            dev_status,
+            max_attempts,
+        )
+        return False
 
     # ------------------------------------------------------------------
     # Static helpers
@@ -643,21 +746,16 @@ class IAlarm:
         if value is None or not isinstance(value, str):
             return key, value
 
-        err_re = re.compile(r"ERR\|(\d{2})")
-        mac_re = re.compile(r"MAC,(\d+)\|(([0-9A-F]{2}[:-]){5}([0-9A-F]{2}))")
-        s32_re = re.compile(r"S32,(\d+),(\d+)\|(\d*)")
-        str_re = re.compile(r"STR,(\d+)\|(.*)")
-        typ_re = re.compile(r"TYP,(\w+)\|(\d+)")
-        if err_re.match(value):
-            value = int(err_re.search(value).groups()[0])
-        elif mac_re.match(value):
-            value = str(mac_re.search(value).groups()[1])
-        elif s32_re.match(value):
-            value = int(s32_re.search(value).groups()[2])
-        elif str_re.match(value):
-            value = str(str_re.search(value).groups()[1])
-        elif typ_re.match(value):
-            value = int(typ_re.search(value).groups()[1])
+        if _RE_ERR.match(value):
+            value = int(_RE_ERR.search(value).groups()[0])
+        elif _RE_MAC.match(value):
+            value = str(_RE_MAC.search(value).groups()[1])
+        elif _RE_S32.match(value):
+            value = int(_RE_S32.search(value).groups()[2])
+        elif _RE_STR.match(value):
+            value = str(_RE_STR.search(value).groups()[1])
+        elif _RE_TYP.match(value):
+            value = int(_RE_TYP.search(value).groups()[1])
         # Else: we are not interested in this value, just keep it as is
 
         return key, value
