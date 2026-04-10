@@ -43,30 +43,29 @@ async def test_is_socket_open_with_no_socket(ialarm):
 
 @pytest.mark.asyncio
 async def test_receive(ialarm):
-    with patch("socket.socket") as mock_socket:
-        mock_socket_instance = mock_socket.return_value
-        mock_socket_instance.fileno.return_value = 1
-        mock_socket_instance.setblocking.side_effect = lambda x: None
-        ialarm.sock = mock_socket_instance
+    # _receive uses the persistent socket directly — just set ialarm.sock
+    mock_socket_instance = Mock()
+    mock_socket_instance.fileno.return_value = 1
+    ialarm.sock = mock_socket_instance
 
-        with patch("asyncio.get_running_loop") as mock_event_loop:
-            mock_event_loop_instance = mock_event_loop.return_value
-            mock_event_loop_instance.time.return_value = 0.0
-            # Valid frame: @ieM + len(4) + seq(4) + 0000 + payload(len bytes) + seq(4)
-            # len=0002, seq=0001, payload=2 bytes "AB", trailing=0001
-            mock_event_loop_instance.sock_recv = AsyncMock(
-                return_value=b"@ieM000200010000AB0001"
-            )
+    with patch("asyncio.get_running_loop") as mock_event_loop:
+        mock_event_loop_instance = mock_event_loop.return_value
+        mock_event_loop_instance.time.return_value = 0.0
+        # Valid frame: @ieM + len(4) + seq(4) + 0000 + payload(len bytes) + seq(4)
+        # len=0002, seq=0001, payload=2 bytes "AB", trailing=0001
+        mock_event_loop_instance.sock_recv = AsyncMock(
+            return_value=b"@ieM000200010000AB0001"
+        )
 
-            with patch.object(
-                ialarm,
-                "_xor",
-                return_value=b"<Root><Data>Mocked XML Data</Data></Root>",
-            ) as mock_xor:
-                response = await ialarm._receive()
-                mock_xor.assert_called_once()
+        with patch.object(
+            ialarm,
+            "_xor",
+            return_value=b"<Root><Data>Mocked XML Data</Data></Root>",
+        ) as mock_xor:
+            response = await ialarm._receive()
+            mock_xor.assert_called_once()
 
-                assert response == {"Root": {"Data": "Mocked XML Data"}}
+            assert response == {"Root": {"Data": "Mocked XML Data"}}
 
 
 @pytest.mark.parametrize(
@@ -190,8 +189,7 @@ async def test_get_zone_status_success(ialarm):
     ialarm._send_request_list = AsyncMock(side_effect=[raw_zone_data, zone_status])
 
     with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
-        with patch.object(ialarm, "_close_connection"):
-            result = await ialarm.get_zone_status()
+        result = await ialarm.get_zone_status()
 
     assert len(result) == 2
     assert result[0]["zone_id"] == 1
@@ -206,8 +204,7 @@ async def test_get_zone_status_no_zones(ialarm):
     ialarm._send_request_list = AsyncMock(return_value=[])
 
     with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
-        with patch.object(ialarm, "_close_connection"):
-            result = await ialarm.get_zone_status()
+        result = await ialarm.get_zone_status()
     assert result == []
 
 
@@ -220,12 +217,11 @@ async def test_get_zone_status_connection_error(ialarm):
     ialarm._send_request_list = AsyncMock(side_effect=[raw_zone_data, None])
 
     with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
-        with patch.object(ialarm, "_close_connection"):
-            with pytest.raises(
-                ConnectionError,
-                match="An error occurred trying to connect to the alarm system",
-            ):
-                await ialarm.get_zone_status()
+        with pytest.raises(
+            ConnectionError,
+            match="An error occurred trying to connect to the alarm system",
+        ):
+            await ialarm.get_zone_status()
 
 
 @pytest.mark.asyncio
@@ -238,8 +234,7 @@ async def test_get_zone_status_no_status(ialarm):
     ialarm._send_request_list = AsyncMock(side_effect=[raw_zone_data, zone_status])
 
     with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
-        with patch.object(ialarm, "_close_connection"):
-            result = await ialarm.get_zone_status()
+        result = await ialarm.get_zone_status()
 
     assert len(result) == 1
     assert result[0]["zone_id"] == 1
@@ -344,15 +339,14 @@ async def test__get_zone(ialarm):
     ]
 
     with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
-        with patch.object(ialarm, "_close_connection"):
-            with patch.object(
-                ialarm, "_send_request_list", new_callable=AsyncMock
-            ) as mock_send:
-                mock_send.return_value = mock_zone_data
+        with patch.object(
+            ialarm, "_send_request_list", new_callable=AsyncMock
+        ) as mock_send:
+            mock_send.return_value = mock_zone_data
 
-                zones = await ialarm._get_zone()
+            zones = await ialarm._get_zone()
 
-                mock_send.assert_awaited_once()
+            mock_send.assert_awaited_once()
     assert len(zones) == 2
     assert zones[0]["zone_id"] == 1
     assert zones[0]["name"] == "Zone"  # Decoded from hex
@@ -367,15 +361,14 @@ async def test_get_zone_type(ialarm):
     mock_zone_types = ["SI", "IN", "NO", "DE"]
 
     with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
-        with patch.object(ialarm, "_close_connection"):
-            with patch.object(
-                ialarm, "_send_request_list", new_callable=AsyncMock
-            ) as mock_send:
-                mock_send.return_value = mock_zone_types
+        with patch.object(
+            ialarm, "_send_request_list", new_callable=AsyncMock
+        ) as mock_send:
+            mock_send.return_value = mock_zone_types
 
-                zone_types = await ialarm.get_zone_type()
+            zone_types = await ialarm.get_zone_type()
 
-                mock_send.assert_awaited_once()
+            mock_send.assert_awaited_once()
     assert len(zone_types) == 4
     assert zone_types[0].value == "Perimeter"  # SI
     assert zone_types[1].value == "Inner"  # IN
@@ -389,15 +382,14 @@ async def test_get_alarm_type(ialarm):
     mock_alarm_types = ["CX", "MC", "NO"]
 
     with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
-        with patch.object(ialarm, "_close_connection"):
-            with patch.object(
-                ialarm, "_send_request_list", new_callable=AsyncMock
-            ) as mock_send:
-                mock_send.return_value = mock_alarm_types
+        with patch.object(
+            ialarm, "_send_request_list", new_callable=AsyncMock
+        ) as mock_send:
+            mock_send.return_value = mock_alarm_types
 
-                alarm_types = await ialarm.get_alarm_type()
+            alarm_types = await ialarm.get_alarm_type()
 
-                mock_send.assert_awaited_once()
+            mock_send.assert_awaited_once()
     assert len(alarm_types) == 3
     assert alarm_types[0].value == "Continued"  # CX
     assert alarm_types[1].value == "Pulsed"  # MC
@@ -889,7 +881,7 @@ async def test_receive_os_error(ialarm):
                 side_effect=OSError("Network error")
             )
 
-            with pytest.raises(OSError):
+            with pytest.raises(ConnectionError):
                 await ialarm._receive()
 
 
@@ -984,26 +976,19 @@ async def test_send_request_list_with_pagination(ialarm):
 
 
 @pytest.mark.asyncio
-async def test_send_request_with_connection_close(ialarm):
-    """Test _send_request closes connection after request."""
+async def test_send_request_keeps_connection_open(ialarm):
+    """Test _send_request does NOT close the connection after request
+    (persistent connection model).
+    """
     command = {"Test": "value"}
 
-    with patch.object(ialarm, "_create_root_dict") as mock_create:
-        mock_create.return_value = {"Root": {"Test": "value"}}
+    with patch.object(ialarm, "_execute", new_callable=AsyncMock) as mock_execute:
+        mock_execute.return_value = {"Result": "success"}
 
-        with (
-            patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock),
-            patch.object(ialarm, "_send_dict", new_callable=AsyncMock),
-            patch.object(ialarm, "_receive", new_callable=AsyncMock) as mock_receive,
-            patch.object(ialarm, "_close_connection") as mock_close,
-        ):
-            mock_receive.return_value = {"Root": {"Test": {"Result": "success"}}}
+        result = await ialarm._send_request("/Root/Test", command)
 
-            result = await ialarm._send_request("/Root/Test", command)
-
-            # Verify connection is closed
-            mock_close.assert_called_once()
-            assert result == {"Result": "success"}
+        mock_execute.assert_awaited_once_with("/Root/Test", command)
+        assert result == {"Result": "success"}
 
 
 @pytest.mark.asyncio
@@ -1014,20 +999,16 @@ async def test_send_dict_method(ialarm):
     with patch("dicttoxml2.dicttoxml") as mock_dicttoxml:
         mock_dicttoxml.return_value = b"<Root><Test>value</Test></Root>"
 
-        with (
-            patch.object(
-                ialarm, "ensure_connection_is_open", new_callable=AsyncMock
-            ) as mock_ensure,
-            patch("asyncio.get_running_loop") as mock_loop,
-        ):
+        with patch("asyncio.get_running_loop") as mock_loop:
             mock_loop_instance = mock_loop.return_value
             mock_loop_instance.sock_sendall = AsyncMock()
 
+            # _send_dict needs an open socket — set it directly
+            ialarm.sock = Mock()
             await ialarm._send_dict(root_dict)
 
             # Verify sequence is incremented
             assert ialarm.seq == 1
-            mock_ensure.assert_awaited_once()
             mock_loop_instance.sock_sendall.assert_awaited_once()
 
 
@@ -1046,8 +1027,7 @@ async def test_get_zone_status_multiple_status_types(ialarm):
     ialarm._send_request_list = AsyncMock(side_effect=[raw_zone_data, zone_status])
 
     with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
-        with patch.object(ialarm, "_close_connection"):
-            result = await ialarm.get_zone_status()
+        result = await ialarm.get_zone_status()
 
     assert len(result) == 2
     assert result[0]["zone_id"] == 1
@@ -1073,8 +1053,7 @@ async def test_get_zone_status_low_battery_and_loss(ialarm):
     ialarm._send_request_list = AsyncMock(side_effect=[raw_zone_data, zone_status])
 
     with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
-        with patch.object(ialarm, "_close_connection"):
-            result = await ialarm.get_zone_status()
+        result = await ialarm.get_zone_status()
 
     assert len(result) == 1
     assert result[0]["zone_id"] == 1
@@ -1218,15 +1197,8 @@ async def test_send_request_raw_returns_subtree(ialarm):
     """Test _send_request_raw returns the xpath subtree dict."""
     command = {"DevStatus": "TYP,DISARM|1", "Err": None}
 
-    with (
-        patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock),
-        patch.object(ialarm, "_send_dict", new_callable=AsyncMock),
-        patch.object(ialarm, "_receive", new_callable=AsyncMock) as mock_receive,
-        patch.object(ialarm, "_close_connection"),
-    ):
-        mock_receive.return_value = {
-            "Root": {"Host": {"SetAlarmStatus": {"DevStatus": 1, "Err": 0}}}
-        }
+    with patch.object(ialarm, "_execute", new_callable=AsyncMock) as mock_execute:
+        mock_execute.return_value = {"DevStatus": 1, "Err": 0}
 
         result = await ialarm._send_request_raw("/Root/Host/SetAlarmStatus", command)
 
@@ -1238,13 +1210,8 @@ async def test_send_request_raw_returns_empty_on_none(ialarm):
     """Test _send_request_raw returns empty dict when subtree is None."""
     command = {"DevStatus": "TYP,DISARM|1", "Err": None}
 
-    with (
-        patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock),
-        patch.object(ialarm, "_send_dict", new_callable=AsyncMock),
-        patch.object(ialarm, "_receive", new_callable=AsyncMock) as mock_receive,
-        patch.object(ialarm, "_close_connection"),
-    ):
-        mock_receive.return_value = {"Root": {"Host": {}}}
+    with patch.object(ialarm, "_execute", new_callable=AsyncMock) as mock_execute:
+        mock_execute.return_value = {}
 
         result = await ialarm._send_request_raw("/Root/Host/SetAlarmStatus", command)
 
@@ -1391,3 +1358,45 @@ async def test_disarm_and_cancel_custom_params(ialarm):
             assert mock_cancel.await_count == 5
             assert mock_sleep.await_count == 5
             mock_sleep.assert_awaited_with(2.0)
+
+
+@pytest.mark.asyncio
+async def test_execute_reconnects_on_connection_failure(ialarm):
+    """Test _execute reconnects and retries once on ConnectionError."""
+    command = {"DevStatus": None, "Err": None}
+
+    with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
+        with patch.object(
+            ialarm, "reconnect", new_callable=AsyncMock
+        ) as mock_reconnect:
+            with patch.object(ialarm, "_send_dict", new_callable=AsyncMock):
+                with patch.object(
+                    ialarm, "_receive", new_callable=AsyncMock
+                ) as mock_receive:
+                    # First call raises ConnectionError, second succeeds
+                    mock_receive.side_effect = [
+                        ConnectionError("Connection dropped"),
+                        {"Root": {"Host": {"GetAlarmStatus": {"DevStatus": 1}}}},
+                    ]
+
+                    result = await ialarm._execute("/Root/Host/GetAlarmStatus", command)
+
+                    mock_reconnect.assert_awaited_once()
+                    assert result == {"DevStatus": 1}
+
+
+@pytest.mark.asyncio
+async def test_execute_raises_on_second_failure(ialarm):
+    """Test _execute propagates ConnectionError if retry also fails."""
+    command = {"DevStatus": None, "Err": None}
+
+    with patch.object(ialarm, "ensure_connection_is_open", new_callable=AsyncMock):
+        with patch.object(ialarm, "reconnect", new_callable=AsyncMock):
+            with patch.object(ialarm, "_send_dict", new_callable=AsyncMock):
+                with patch.object(
+                    ialarm, "_receive", new_callable=AsyncMock
+                ) as mock_receive:
+                    mock_receive.side_effect = ConnectionError("Persistent failure")
+
+                    with pytest.raises(ConnectionError, match="Persistent failure"):
+                        await ialarm._execute("/Root/Host/GetAlarmStatus", command)

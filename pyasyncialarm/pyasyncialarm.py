@@ -33,16 +33,24 @@ log = logging.getLogger(__name__)
 logging.getLogger("dicttoxml").setLevel(logging.CRITICAL)
 
 # Pre-compiled regex patterns used by _xmlread to parse iAlarm XML value tokens.
-# Compiled once at module load to avoid repeated re.compile() on every XML node.
 _RE_ERR = re.compile(r"ERR\|(\d{2})")
 _RE_MAC = re.compile(r"MAC,(\d+)\|(([0-9A-F]{2}[:-]){5}([0-9A-F]{2}))")
 _RE_S32 = re.compile(r"S32,(\d+),(\d+)\|(\d*)")
 _RE_STR = re.compile(r"STR,(\d+)\|(.*)")
 _RE_TYP = re.compile(r"TYP,(\w+)\|(\d+)")
 
+# How long to wait before attempting to reconnect after a connection drop
+_RECONNECT_DELAY = 2.0
+
 
 class IAlarm:
-    """Interface the iAlarm security systems."""
+    """Interface the iAlarm security systems.
+
+    Uses a single persistent TCP connection that is shared across all
+    requests. The connection is opened on first use and automatically
+    re-established if it drops. All send/receive operations are
+    serialised via an asyncio.Lock to prevent frame interleaving.
+    """
 
     ARMED_AWAY = 0
     DISARMED = 1
@@ -60,16 +68,23 @@ class IAlarm:
         self.sock = None
         self._lock = asyncio.Lock()
 
+    # ------------------------------------------------------------------
+    # Connection management
+    # ------------------------------------------------------------------
+
     def _is_socket_open(self) -> bool:
         return self.sock is not None and self.sock.fileno() != -1
 
     async def reconnect(self) -> None:
+        """Open a fresh TCP connection, resetting the sequence counter."""
+        self._close_connection()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setblocking(False)
         self.seq = 0
         loop = asyncio.get_running_loop()
         try:
             await loop.sock_connect(self.sock, (self.host, self.port))
+            log.debug("Connected to %s:%s", self.host, self.port)
         except (TimeoutError, OSError, ConnectionRefusedError) as err:
             self._close_connection()
             raise IAlarmConnectionError from err
@@ -78,10 +93,8 @@ class IAlarm:
             raise
 
     async def ensure_connection_is_open(self, force_reconnect: bool = False) -> None:
-        if force_reconnect:
-            log.debug("Forcing reconnect the socket...")
-            await self.reconnect()
-        elif not self._is_socket_open():
+        """Ensure the socket is open, reconnecting if necessary."""
+        if force_reconnect or not self._is_socket_open():
             await self.reconnect()
         else:
             log.debug("Socket is already connected.")
@@ -89,6 +102,7 @@ class IAlarm:
     def _close_connection(self) -> None:
         if self.sock and self.sock.fileno() != -1:
             self.sock.close()
+        self.sock = None
 
     async def shutdown(self) -> None:
         """Close the socket cleanly. Call this when HA stops."""
@@ -99,29 +113,21 @@ class IAlarm:
     # ------------------------------------------------------------------
 
     def _is_trigger_frame(self, buffer: bytes) -> bool:
-        """Return True if the buffer starts with an alarm-trigger frame."""
         return buffer.startswith(b"@alA0")
 
     def _is_standard_frame(self, buffer: bytes) -> bool:
-        """Return True if the buffer starts with a standard @ieM frame."""
         return buffer.startswith(b"@ieM")
 
     def _trigger_frame_complete(self, buffer: bytes) -> bool:
-        """Return True when the buffer contains a complete trigger frame (ends with FFFF)."""
         return b"FFFF" in buffer
 
     def _standard_frame_complete(self, buffer: bytes) -> bool:
-        """Return True when the buffer contains a complete standard @ieM frame.
-
-        A complete frame ends with a 4-digit decimal sequence number that
-        matches the one in the header.
+        """Return True when buffer contains a complete @ieM frame.
 
         Frame layout:
           @ieM<len:4><seq:4>0000<XOR(payload)><seq:4>
           0    4      8     12   16            16+len
-          ← ──────── 16 bytes header ────────→
-
-        Total expected size = 16 (header) + len + 4 (trailing seq)
+          Total = 16 (header) + len + 4 (trailing seq)
         """
         if len(buffer) < 16:
             return False
@@ -132,13 +138,11 @@ class IAlarm:
         expected_total = 16 + msg_len + 4
         if len(buffer) < expected_total:
             return False
-        # Verify the trailing seq matches the header seq
         header_seq = buffer[8:12]
         trailing_seq = buffer[expected_total - 4 : expected_total]
         return header_seq == trailing_seq
 
     def _frame_complete(self, buffer: bytes) -> bool:
-        """Check whether the accumulated buffer contains a complete frame."""
         if not buffer:
             return False
         if self._is_trigger_frame(buffer):
@@ -148,23 +152,15 @@ class IAlarm:
         return False
 
     def _strip_leading_trigger_frames(self, buffer: bytes) -> bytes:
-        """When the alarm is sounding the centralina may send one or more
-        unsolicited trigger frames (@alA0...FFFF) before or interleaved
-        with the actual command response.
-
-        This method discards all leading trigger frames so that
-        _extract_payload can work on a clean @ieM frame.
-        """
+        """Discard all leading trigger frames (@alA0...FFFF) from buffer."""
         while buffer.startswith(b"@alA0"):
             ffff_pos = buffer.find(b"FFFF")
             if ffff_pos == -1:
-                # Trigger frame not yet complete — caller should read more data
                 log.debug("Incomplete trigger frame in buffer, need more data")
                 return buffer
             end = ffff_pos + 4
             log.debug("Discarding trigger frame of %d bytes", end)
             buffer = buffer[end:]
-            # Skip any whitespace / null bytes between frames
             buffer = buffer.lstrip(b"\x00")
         return buffer
 
@@ -173,13 +169,6 @@ class IAlarm:
     # ------------------------------------------------------------------
 
     def _extract_payload(self, buffer: bytes) -> bytes:
-        """Extract the XOR-obfuscated payload from a complete @ieM frame.
-
-        Frame layout:
-          @ieM<len:4><seq:4>0000  → 16 bytes header
-          <XOR(payload)>          → len bytes
-          <seq:4>                 → 4 bytes trailer
-        """
         try:
             msg_len = int(buffer[4:8])
         except ValueError as e:
@@ -189,22 +178,18 @@ class IAlarm:
         return buffer[16 : 16 + msg_len]
 
     # ------------------------------------------------------------------
-    # Core receive loop
+    # Core receive — uses the persistent socket, no open/close
     # ------------------------------------------------------------------
 
     async def _receive(self):
-        """Receive a complete frame from the socket, accumulating chunks
-        until the frame is complete.
+        """Receive a complete frame from the persistent socket.
 
-        Key improvements over the previous single-recv approach:
-        - Accumulates data across multiple recv() calls (TCP fragmentation)
-        - Discards unsolicited trigger frames (@alA0...FFFF) that arrive
-          while the alarm is sounding, before or mixed with the response
-        - Validates frame length from the header rather than relying on
-          heuristics like buffer[-4:].isdigit()
+        Accumulates chunks until the frame is complete. Trigger frames
+        (@alA0...FFFF) arriving while the alarm is sounding are discarded
+        transparently. On any socket error the connection is closed so
+        the next request will trigger a reconnect.
         """
         try:
-            await self.ensure_connection_is_open()
             loop = asyncio.get_running_loop()
             buffer = b""
             deadline = loop.time() + SOCKET_TIMEOUT
@@ -213,7 +198,7 @@ class IAlarm:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     self.__raise_connection_error(
-                        "Socket timeout: no complete frame received within "
+                        f"Socket timeout: no complete frame received within "
                         f"{SOCKET_TIMEOUT}s. Buffer so far: {buffer[:64]!r}"
                     )
 
@@ -224,7 +209,7 @@ class IAlarm:
                     )
                 except TimeoutError:
                     self.__raise_connection_error(
-                        "Socket timeout: no complete frame received within "
+                        f"Socket timeout: no complete frame received within "
                         f"{SOCKET_TIMEOUT}s. Buffer so far: {buffer[:64]!r}"
                     )
 
@@ -236,20 +221,15 @@ class IAlarm:
                 buffer += chunk
                 log.debug("Accumulated %d bytes (chunk: %d)", len(buffer), len(chunk))
 
-                # Discard leading trigger frames so we can assess the
-                # real response underneath.
                 buffer = self._strip_leading_trigger_frames(buffer)
 
                 if not buffer:
-                    # Everything received so far was trigger frames;
-                    # keep reading until we get the actual response.
                     log.debug(
                         "Buffer empty after stripping trigger frames, reading more"
                     )
                     continue
 
                 if not self._is_standard_frame(buffer):
-                    # Unexpected frame start — log and bail out
                     self.__raise_connection_error(
                         f"Unexpected frame start: {buffer[:16]!r}"
                     )
@@ -261,7 +241,6 @@ class IAlarm:
                 log.debug("Frame incomplete, reading more data...")
 
             payload = self._extract_payload(buffer)
-
             decoded = (
                 self._xor(payload)
                 .decode(errors="ignore")
@@ -277,14 +256,15 @@ class IAlarm:
 
             return await self._parse_decoded_message(decoded)
 
+        except ConnectionError:
+            raise
         except OSError as e:
             self._close_connection()
-            log.error("OSError occurred: %s", e)
-            raise
-
+            log.error("OSError in _receive: %s", e)
+            raise ConnectionError(str(e)) from e
         except Exception as e:
             self._close_connection()
-            log.error("Exception occurred: %s", e)
+            log.error("Exception in _receive: %s", e)
             raise
 
     async def _parse_decoded_message(self, decoded):
@@ -303,24 +283,61 @@ class IAlarm:
             self.__raise_connection_error("Received malformed XML response")
 
     def __raise_connection_error(self, msg: str):
-        """Close the connection and raises a connection error."""
+        """Close the connection and raise a ConnectionError."""
         self._close_connection()
         raise ConnectionError(msg)
 
     # ------------------------------------------------------------------
-    # Send helpers
+    # Send helpers — persistent connection, reconnect on failure
     # ------------------------------------------------------------------
 
     async def _send_dict(self, root_dict) -> None:
+        """Serialise root_dict to XML, XOR-encode and send over the socket."""
         xml = dicttoxml2.dicttoxml(root_dict, attr_type=False, root=False)
-
-        await self.ensure_connection_is_open()
-
         self.seq += 1
         msg = b"@ieM%04d%04d0000%s%04d" % (len(xml), self.seq, self._xor(xml), self.seq)
-
         loop = asyncio.get_running_loop()
         await loop.sock_sendall(self.sock, msg)
+
+    async def _execute(
+        self, xpath: str, command: OrderedDict[str, Any | None]
+    ) -> dict[str, Any]:
+        """Send one request and return the full parsed response subtree.
+
+        Uses the persistent connection. If the connection is closed,
+        reconnects once before giving up.
+        Called exclusively from within an acquired self._lock context.
+        """
+        await self.ensure_connection_is_open()
+        root_dict = self._create_root_dict(xpath, command)
+        try:
+            await self._send_dict(root_dict)
+            response = await self._receive()
+        except ConnectionError:
+            # Connection dropped mid-request — reconnect and retry once
+            log.warning("Connection lost during request, reconnecting and retrying...")
+            await self.reconnect()
+            await self._send_dict(root_dict)
+            response = await self._receive()
+        return self._clean_response_dict(response, xpath) or {}
+
+    async def _send_request(
+        self, xpath: str, command: OrderedDict[str, Any | None]
+    ) -> dict[str, Any]:
+        """Acquire the lock, execute a single request, return the xpath subtree."""
+        async with self._lock:
+            return await self._execute(xpath, command)
+
+    async def _send_request_raw(
+        self, xpath: str, command: OrderedDict[str, Any | None]
+    ) -> dict[str, Any]:
+        """Like _send_request but returns the xpath subtree (same as _send_request).
+
+        Kept as a separate method for API clarity — callers that need
+        DevStatus + Err from SetAlarmStatus responses use this explicitly.
+        """
+        async with self._lock:
+            return await self._execute(xpath, command)
 
     async def _send_request_list(
         self,
@@ -329,19 +346,24 @@ class IAlarm:
         offset: int = 0,
         partial_list: list[Any] | None = None,
     ) -> list[Any]:
-        """Send a paginated list request.
+        """Send a paginated list request on the already-open persistent connection.
 
-        Must be called from within an acquired self._lock context,
-        with an open connection already established.
-        Pagination is handled internally via recursion without reopening
-        the socket between pages.
-        Does NOT close the connection — the caller is responsible for that.
+        Must be called from within an acquired self._lock context.
+        Does NOT manage the lock itself.
         """
         if offset > 0:
             command["Offset"] = f"S32,0,0|{offset}"
         root_dict: dict[str, Any] = self._create_root_dict(xpath, command)
-        await self._send_dict(root_dict)
-        response: dict[str, Any] = await self._receive()
+        try:
+            await self._send_dict(root_dict)
+            response: dict[str, Any] = await self._receive()
+        except ConnectionError:
+            log.warning(
+                "Connection lost during list request, reconnecting and retrying..."
+            )
+            await self.reconnect()
+            await self._send_dict(root_dict)
+            response = await self._receive()
 
         if partial_list is None:
             partial_list = []
@@ -352,7 +374,6 @@ class IAlarm:
         offset += ln
         if total > offset:
             await self._send_request_list(xpath, command, offset, partial_list)
-
         return partial_list
 
     async def _send_request_list_locked(
@@ -360,51 +381,16 @@ class IAlarm:
         xpath: str,
         command: OrderedDict[str, Any | None],
     ) -> list[Any]:
-        """Acquire the lock, open a fresh connection, run a full paginated
-        list request, then close the connection regardless of outcome.
-        """
+        """Acquire the lock and run a full paginated list request."""
         async with self._lock:
-            try:
-                await self.ensure_connection_is_open(force_reconnect=True)
-                return await self._send_request_list(xpath, command)
-            finally:
-                self._close_connection()
-
-    async def _send_request(
-        self, xpath: str, command: OrderedDict[str, Any | None]
-    ) -> dict[str, Any]:
-        """Acquire the lock, send a single request and return the parsed response."""
-        async with self._lock:
-            await self.ensure_connection_is_open(force_reconnect=True)
-            root_dict = self._create_root_dict(xpath, command)
-            await self._send_dict(root_dict)
-            response = await self._receive()
-            self._close_connection()
-            return self._clean_response_dict(response, xpath)
-
-    async def _send_request_raw(
-        self, xpath: str, command: OrderedDict[str, Any | None]
-    ) -> dict[str, Any]:
-        """Like _send_request but returns the full parsed response dict.
-
-        Use this when the caller needs to inspect fields beyond the xpath
-        subtree — for example reading both Err and DevStatus from a
-        SetAlarmStatus response.
-        """
-        async with self._lock:
-            await self.ensure_connection_is_open(force_reconnect=True)
-            root_dict = self._create_root_dict(xpath, command)
-            await self._send_dict(root_dict)
-            response = await self._receive()
-            self._close_connection()
-            return self._clean_response_dict(response, xpath) or {}
+            await self.ensure_connection_is_open()
+            return await self._send_request_list(xpath, command)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     async def get_mac(self) -> str:
-        mac = ""
         command: OrderedDict[str, Any | None] = OrderedDict()
         command["Mac"] = None
         command["Name"] = None
@@ -418,14 +404,13 @@ class IAlarm:
 
         if network_info is not None:
             mac = network_info.get("Mac", "")
+            if mac:
+                return mac
 
-        if mac:
-            return mac
-        error_message = (
+        raise ConnectionError(
             "An error occurred trying to connect to the alarm system or received an"
             " unexpected reply"
         )
-        raise ConnectionError(error_message)
 
     async def get_last_log_entries(self, max_entries: int = 25) -> list[LogEntryType]:
         log_list = await self.get_log()
@@ -434,13 +419,7 @@ class IAlarm:
         return log_list[:max_entries]
 
     async def get_zone_status(self) -> list[ZoneStatusType]:
-        """Fetch zone names and zone status in a single locked TCP session.
-
-        Previously this called get_zone() and GetByWay in two separate
-        sessions, leaving the socket in an inconsistent state between them.
-        Now both paginated requests share one connection under one lock
-        acquisition, which also halves the number of TCP handshakes.
-        """
+        """Fetch zone names and zone status in a single locked session."""
         zone_command: OrderedDict[str, Any | None] = OrderedDict()
         zone_command["Total"] = None
         zone_command["Offset"] = "S32,0,0|0"
@@ -454,16 +433,13 @@ class IAlarm:
         status_command["Err"] = None
 
         async with self._lock:
-            try:
-                await self.ensure_connection_is_open(force_reconnect=True)
-                raw_zone_data: list[ZoneTypeRaw] = await self._send_request_list(
-                    "/Root/Host/GetZone", zone_command
-                )
-                zone_status: list[int] = await self._send_request_list(
-                    "/Root/Host/GetByWay", status_command
-                )
-            finally:
-                self._close_connection()
+            await self.ensure_connection_is_open()
+            raw_zone_data: list[ZoneTypeRaw] = await self._send_request_list(
+                "/Root/Host/GetZone", zone_command
+            )
+            zone_status: list[int] = await self._send_request_list(
+                "/Root/Host/GetByWay", status_command
+            )
 
         zone_name_map = {
             i + 1: decode_name(zone["Name"]) for i, zone in enumerate(raw_zone_data)
@@ -477,9 +453,7 @@ class IAlarm:
         result = []
         for i, status in enumerate(zone_status):
             zone_id = i + 1
-
             status_list = []
-
             if status & StatusType.ZONE_IN_USE:
                 status_list.append(StatusType.ZONE_IN_USE)
             if status & StatusType.ZONE_ALARM:
@@ -492,27 +466,24 @@ class IAlarm:
                 status_list.append(StatusType.ZONE_LOW_BATTERY)
             if status & StatusType.ZONE_LOSS:
                 status_list.append(StatusType.ZONE_LOSS)
-
             if not status_list:
                 status_list.append(StatusType.ZONE_NOT_USED)
-
-            zone_item: ZoneStatusType = {
-                "zone_id": zone_id,
-                "name": zone_name_map.get(zone_id, "Unknown"),
-                "types": status_list,
-            }
-            result.append(zone_item)
-
+            result.append(
+                ZoneStatusType(
+                    zone_id=zone_id,
+                    name=zone_name_map.get(zone_id, "Unknown"),
+                    types=status_list,
+                )
+            )
         return result
 
     def __create_ialarm_status(
         self, status_value: int, zones: list[ZoneStatusType] | None = None
     ) -> AlarmStatusType:
-        alarm_status: AlarmStatusType = {
-            "status_value": status_value,
-            "alarmed_zones": zones if zones is not None else [],
-        }
-        return alarm_status
+        return AlarmStatusType(
+            status_value=status_value,
+            alarmed_zones=zones if zones is not None else [],
+        )
 
     async def get_status(
         self, extra_info_zone_status: list[ZoneStatusType]
@@ -521,23 +492,19 @@ class IAlarm:
         command["DevStatus"] = None
         command["Err"] = None
 
-        alarm_status: dict[str, Any] = await self._send_request(
-            "/Root/Host/GetAlarmStatus", command
-        )
+        alarm_status = await self._send_request("/Root/Host/GetAlarmStatus", command)
 
         if alarm_status is None:
-            error_message = "An error occurred trying to connect to the alarm system"
-            raise ConnectionError(error_message)
+            raise ConnectionError(
+                "An error occurred trying to connect to the alarm system"
+            )
 
         status = int(alarm_status.get("DevStatus", -1))
         if status == -1:
-            error_message = "Received an unexpected reply from the alarm"
-            raise ConnectionError(error_message)
+            raise ConnectionError("Received an unexpected reply from the alarm")
 
         if status in {self.ARMED_AWAY, self.ARMED_STAY} and extra_info_zone_status:
-            alarmed_zones: list[ZoneStatusType] = self.__filter_alarmed_zones(
-                extra_info_zone_status
-            )
+            alarmed_zones = self.__filter_alarmed_zones(extra_info_zone_status)
             if any(StatusType.ZONE_ALARM in zone["types"] for zone in alarmed_zones):
                 return self.__create_ialarm_status(self.TRIGGERED, alarmed_zones)
 
@@ -564,7 +531,7 @@ class IAlarm:
             "/Root/Host/GetLog", command
         )
 
-        logs = [
+        return [
             LogEntryType(
                 time=parse_time(event["Time"]),
                 area=event["Area"],
@@ -573,8 +540,6 @@ class IAlarm:
             )
             for event in event_log_raw
         ]
-
-        return logs
 
     def __extract_zones(self, zone_data_raw: list[ZoneTypeRaw]) -> list[ZoneType]:
         return [
@@ -589,23 +554,16 @@ class IAlarm:
         ]
 
     async def _get_zone(self) -> list[ZoneType]:
-        """Fetch zone definitions (name, type, bell) from the alarm panel.
-
-        Internal use only — called within get_zone_status() under the lock.
-        External callers should use get_zone_status() instead.
-        """
+        """Fetch zone definitions. Internal use only."""
         command: OrderedDict[str, Any | None] = OrderedDict()
         command["Total"] = None
         command["Offset"] = "S32,0,0|0"
         command["Ln"] = None
         command["Err"] = None
-
         raw_zone_data: list[ZoneTypeRaw] = await self._send_request_list_locked(
             "/Root/Host/GetZone", command
         )
-        zone: list[ZoneType] = self.__extract_zones(raw_zone_data)
-
-        return zone
+        return self.__extract_zones(raw_zone_data)
 
     async def get_zone_type(self) -> list[ZoneTypeEnum]:
         command: OrderedDict[str, Any | None] = OrderedDict()
@@ -613,15 +571,12 @@ class IAlarm:
         command["Offset"] = "S32,0,0|0"
         command["Ln"] = None
         command["Err"] = None
-
         zone_type_codes = await self._send_request_list_locked(
             "/Root/Host/GetZoneType", command
         )
-        zone_types = [
+        return [
             ZONE_TYPE_MAP.get(code, ZoneTypeEnum.UNUSED) for code in zone_type_codes
         ]
-
-        return zone_types
 
     async def get_alarm_type(self) -> list[SirenSoundTypeEnum]:
         command: OrderedDict[str, Any | None] = OrderedDict()
@@ -629,16 +584,13 @@ class IAlarm:
         command["Offset"] = "S32,0,0|0"
         command["Ln"] = None
         command["Err"] = None
-
         alarm_type_codes = await self._send_request_list_locked(
             "/Root/Host/GetVoiceType", command
         )
-        zone_types = [
+        return [
             ALARM_TYPE_MAP.get(code, SirenSoundTypeEnum.CONTINUED)
             for code in alarm_type_codes
         ]
-
-        return zone_types
 
     async def arm_away(self) -> None:
         """Arm the alarm system in away mode."""
@@ -658,9 +610,8 @@ class IAlarm:
         """Send the disarm command and return the DevStatus from the response.
 
         Returns:
-            The DevStatus integer returned by the panel (0=armed away,
-            1=disarmed, 2=armed stay, 3=cancel, 4=triggered).
-            Returns -1 if the panel did not return a valid status.
+            DevStatus integer (0=armed away, 1=disarmed, 2=armed stay,
+            3=cancel, 4=triggered), or -1 if no valid status was returned.
 
         """
         command: OrderedDict[str, Any | None] = OrderedDict()
@@ -673,8 +624,7 @@ class IAlarm:
         """Send the cancel/clear command and return the DevStatus from the response.
 
         Returns:
-            The DevStatus integer returned by the panel.
-            Returns -1 if the panel did not return a valid status.
+            DevStatus integer, or -1 if no valid status was returned.
 
         """
         command: OrderedDict[str, Any | None] = OrderedDict()
@@ -690,18 +640,12 @@ class IAlarm:
     ) -> bool:
         """Disarm the panel and ensure any active alarm is cleared.
 
-        This is the recommended method to call when the alarm is sounding.
-        It sends a disarm command, reads the DevStatus from the response,
-        and if the panel is still in a triggered state it retries cancel_alarm
-        up to max_attempts times with retry_delay seconds between each attempt.
-
-        Args:
-            max_attempts: Maximum number of cancel_alarm attempts after disarm.
-            retry_delay:  Seconds to wait between cancel attempts.
+        Sends a disarm command, reads DevStatus from the response, and if
+        the panel is still triggered retries cancel_alarm up to max_attempts
+        times with retry_delay seconds between each attempt.
 
         Returns:
-            True if the panel confirmed a non-triggered state within the
-            allowed attempts, False if it remained triggered after all retries.
+            True if the panel confirmed a non-triggered state, False otherwise.
 
         """
         log.debug("disarm_and_cancel: sending disarm")
@@ -745,7 +689,6 @@ class IAlarm:
     def _xmlread(_path, key, value):
         if value is None or not isinstance(value, str):
             return key, value
-
         if _RE_ERR.match(value):
             value = int(_RE_ERR.search(value).groups()[0])
         elif _RE_MAC.match(value):
@@ -756,8 +699,6 @@ class IAlarm:
             value = str(_RE_STR.search(value).groups()[1])
         elif _RE_TYP.match(value):
             value = int(_RE_TYP.search(value).groups()[1])
-        # Else: we are not interested in this value, just keep it as is
-
         return key, value
 
     @staticmethod
@@ -794,5 +735,4 @@ class IAlarm:
         for i in range(len(xml)):
             ki = i & 0x7F
             buf[i] = buf[i] ^ sz[ki]
-
         return buf
