@@ -1,7 +1,7 @@
 """Constants for iAlarm Home Assistant Integration."""
 
 from datetime import datetime
-from enum import Enum, IntEnum
+from enum import IntEnum, StrEnum
 from typing import TypedDict
 
 
@@ -106,7 +106,7 @@ class AlarmStatusType(TypedDict):
     alarmed_zones: list[ZoneStatusType] | None
 
 
-class ZoneTypeEnum(str, Enum):
+class ZoneTypeEnum(StrEnum):
     UNUSED = "Unused"
     DELAY = "Delay"
     PERIMETER = "Perimeter"
@@ -119,7 +119,7 @@ class ZoneTypeEnum(str, Enum):
     WATER = "Water"
 
 
-class SirenSoundTypeEnum(str, Enum):
+class SirenSoundTypeEnum(StrEnum):
     CONTINUED = "Continued"
     PULSED = "Pulsed"
     MUTE = "Mute"

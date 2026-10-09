@@ -1,11 +1,12 @@
 [build-system]
-requires = ["setuptools==68.0.0", "wheel~=0.40.0"]
+requires = ["setuptools==84.0.0", "wheel>=0.46.3,<0.49.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name        = "pyasyncialarm"
 version     = "3.0.1"
-license     = {text = "Apache-2.0"}
+license     = "Apache-2.0"
+license-files = ["LICENSE"]
 description = "A simple library to interface with iAlarm systems, built for use with Home-Assistant"
 readme      = "README.md"
 authors     = [
@@ -16,7 +17,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3.14",
-    "License :: OSI Approved :: Apache Software License",
     "Topic :: Software Development :: Libraries",
 ]
 requires-python = ">=3.14.0"
@@ -655,7 +655,6 @@ ignore = [
     "UP006", # keep type annotation style as is
     "UP007", # keep type annotation style as is
     # Ignored due to performance: https://github.com/charliermarsh/ruff/issues/2923
-    "UP038", # Use `X | Y` in `isinstance` call instead of `(X, Y)`
     # Ignored due to incompatible with mypy: https://github.com/python/mypy/issues/15238
     "UP040", # Checks for use of TypeAlias annotation for declaring type aliases.
 
