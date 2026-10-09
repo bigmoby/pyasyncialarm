@@ -1471,9 +1471,9 @@ async def test_send_dict_os_error(ialarm):
     ialarm.sock.fileno.return_value = 1
     with patch("asyncio.get_running_loop") as mock_loop:
         mock_loop.return_value.sock_sendall = AsyncMock(
-            side_effect=BrokenPipeError("broken pipe")
+            side_effect=OSError(113, "No route to host")
         )
-        with pytest.raises(ConnectionError, match="broken pipe"):
+        with pytest.raises(ConnectionError, match="No route to host"):
             await ialarm._send_dict({"Root": {}})
 
     assert ialarm.sock is None
@@ -1502,18 +1502,17 @@ async def test_request_cancelled_closes_connection(ialarm):
 
 @pytest.mark.asyncio
 async def test_request_retried_after_send_failure(ialarm):
-    """Test a failed send reconnects and retries the request once."""
+    """Test a socket error while sending reconnects and retries the request once."""
     ialarm.sock = Mock()
     ialarm.sock.fileno.return_value = 1
 
+    async def reconnect():
+        ialarm.sock = Mock()
+        ialarm.sock.fileno.return_value = 1
+
     with (
-        patch.object(
-            ialarm,
-            "_send_dict",
-            new_callable=AsyncMock,
-            side_effect=[ConnectionError("send failed"), None],
-        ) as mock_send,
-        patch.object(ialarm, "reconnect", new_callable=AsyncMock) as mock_reconnect,
+        patch("asyncio.get_running_loop") as mock_loop,
+        patch.object(ialarm, "reconnect", side_effect=reconnect) as mock_reconnect,
         patch.object(
             ialarm,
             "_receive",
@@ -1521,7 +1520,10 @@ async def test_request_retried_after_send_failure(ialarm):
             return_value={"Root": {"Host": {"GetNet": {"Mac": "00:11:22:33:44:55"}}}},
         ),
     ):
+        mock_loop.return_value.sock_sendall = AsyncMock(
+            side_effect=[OSError(113, "No route to host"), None]
+        )
         assert await ialarm.get_mac() == "00:11:22:33:44:55"
 
     mock_reconnect.assert_awaited_once()
-    assert mock_send.await_count == 2
+    assert mock_loop.return_value.sock_sendall.await_count == 2
