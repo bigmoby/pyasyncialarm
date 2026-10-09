@@ -1,4 +1,5 @@
 # mypy: ignore-errors
+import asyncio
 from datetime import datetime
 from unittest.mock import AsyncMock, Mock, patch
 import xml.etree.ElementTree as ET
@@ -1400,3 +1401,127 @@ async def test_execute_raises_on_second_failure(ialarm):
 
                     with pytest.raises(ConnectionError, match="Persistent failure"):
                         await ialarm._execute("/Root/Host/GetAlarmStatus", command)
+
+
+async def _hang(*args, **kwargs):
+    """Never complete, like a socket call towards an unreachable host."""
+    await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_timeout(ialarm):
+    """Test connecting to an unreachable panel times out and closes the socket."""
+    with (
+        patch("socket.socket") as mock_socket_class,
+        patch("pyasyncialarm.pyasyncialarm.SOCKET_TIMEOUT", 0.01),
+        patch("asyncio.get_running_loop") as mock_loop,
+    ):
+        mock_socket = mock_socket_class.return_value
+        mock_socket.fileno.return_value = 1
+        mock_loop.return_value.sock_connect = _hang
+
+        with pytest.raises(IAlarmConnectionError):
+            await ialarm.reconnect()
+
+        mock_socket.close.assert_called_once()
+        assert ialarm.sock is None
+
+
+@pytest.mark.asyncio
+async def test_reconnect_cancelled_closes_socket(ialarm):
+    """Test a cancelled connection attempt does not leave a half-open socket."""
+    with (
+        patch("socket.socket") as mock_socket_class,
+        patch("asyncio.get_running_loop") as mock_loop,
+    ):
+        mock_socket = mock_socket_class.return_value
+        mock_socket.fileno.return_value = 1
+        mock_loop.return_value.sock_connect = _hang
+
+        task = asyncio.ensure_future(ialarm.reconnect())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        mock_socket.close.assert_called_once()
+        assert ialarm.sock is None
+
+
+@pytest.mark.asyncio
+async def test_send_dict_timeout(ialarm):
+    """Test a send that never completes raises ConnectionError and closes."""
+    ialarm.sock = Mock()
+    ialarm.sock.fileno.return_value = 1
+    with (
+        patch("pyasyncialarm.pyasyncialarm.SOCKET_TIMEOUT", 0.01),
+        patch("asyncio.get_running_loop") as mock_loop,
+    ):
+        mock_loop.return_value.sock_sendall = _hang
+        with pytest.raises(ConnectionError, match="not sent"):
+            await ialarm._send_dict({"Root": {}})
+
+    assert ialarm.sock is None
+
+
+@pytest.mark.asyncio
+async def test_send_dict_os_error(ialarm):
+    """Test a socket error while sending raises ConnectionError and closes."""
+    ialarm.sock = Mock()
+    ialarm.sock.fileno.return_value = 1
+    with patch("asyncio.get_running_loop") as mock_loop:
+        mock_loop.return_value.sock_sendall = AsyncMock(
+            side_effect=BrokenPipeError("broken pipe")
+        )
+        with pytest.raises(ConnectionError, match="broken pipe"):
+            await ialarm._send_dict({"Root": {}})
+
+    assert ialarm.sock is None
+
+
+@pytest.mark.asyncio
+async def test_request_cancelled_closes_connection(ialarm):
+    """Test cancelling a request mid-reply closes the persistent connection."""
+    ialarm.sock = Mock()
+    ialarm.sock.fileno.return_value = 1
+
+    with (
+        patch.object(ialarm, "_send_dict", new_callable=AsyncMock),
+        patch.object(ialarm, "_receive", side_effect=_hang),
+    ):
+        task = asyncio.ensure_future(ialarm.get_mac())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert ialarm.sock is None
+    # The lock is released, so the next request can proceed
+    assert not ialarm._lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_request_retried_after_send_failure(ialarm):
+    """Test a failed send reconnects and retries the request once."""
+    ialarm.sock = Mock()
+    ialarm.sock.fileno.return_value = 1
+
+    with (
+        patch.object(
+            ialarm,
+            "_send_dict",
+            new_callable=AsyncMock,
+            side_effect=[ConnectionError("send failed"), None],
+        ) as mock_send,
+        patch.object(ialarm, "reconnect", new_callable=AsyncMock) as mock_reconnect,
+        patch.object(
+            ialarm,
+            "_receive",
+            new_callable=AsyncMock,
+            return_value={"Root": {"Host": {"GetNet": {"Mac": "00:11:22:33:44:55"}}}},
+        ),
+    ):
+        assert await ialarm.get_mac() == "00:11:22:33:44:55"
+
+    mock_reconnect.assert_awaited_once()
+    assert mock_send.await_count == 2

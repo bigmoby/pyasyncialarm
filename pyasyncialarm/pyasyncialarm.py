@@ -83,12 +83,16 @@ class IAlarm:
         self.seq = 0
         loop = asyncio.get_running_loop()
         try:
-            await loop.sock_connect(self.sock, (self.host, self.port))
+            # Without a timeout an unreachable panel (packets dropped, no RST)
+            # would block until the OS TCP connect timeout, i.e. minutes.
+            async with asyncio.timeout(SOCKET_TIMEOUT):
+                await loop.sock_connect(self.sock, (self.host, self.port))
             log.debug("Connected to %s:%s", self.host, self.port)
         except (TimeoutError, OSError, ConnectionRefusedError) as err:
             self._close_connection()
             raise IAlarmConnectionError from err
-        except Exception:
+        except BaseException:
+            # Includes asyncio.CancelledError: never keep a half-open socket
             self._close_connection()
             raise
 
@@ -297,7 +301,30 @@ class IAlarm:
         self.seq += 1
         msg = b"@ieM%04d%04d0000%s%04d" % (len(xml), self.seq, self._xor(xml), self.seq)
         loop = asyncio.get_running_loop()
-        await loop.sock_sendall(self.sock, msg)
+        try:
+            async with asyncio.timeout(SOCKET_TIMEOUT):
+                await loop.sock_sendall(self.sock, msg)
+        except TimeoutError:
+            self.__raise_connection_error(
+                f"Socket timeout: request not sent within {SOCKET_TIMEOUT}s."
+            )
+        except OSError as e:
+            self.__raise_connection_error(f"OSError while sending request: {e}")
+
+    async def _roundtrip(self, root_dict) -> Any:
+        """Send one request and receive its response on the open socket.
+
+        If the caller is cancelled mid-request (e.g. an outer timeout), the
+        connection is closed: a partially sent request or a half-read reply
+        would otherwise be consumed by the next request on the same socket.
+        """
+        try:
+            await self._send_dict(root_dict)
+            return await self._receive()
+        except asyncio.CancelledError:
+            log.debug("Request cancelled, closing the connection")
+            self._close_connection()
+            raise
 
     async def _execute(
         self, xpath: str, command: OrderedDict[str, Any | None]
@@ -311,14 +338,12 @@ class IAlarm:
         await self.ensure_connection_is_open()
         root_dict = self._create_root_dict(xpath, command)
         try:
-            await self._send_dict(root_dict)
-            response = await self._receive()
+            response = await self._roundtrip(root_dict)
         except ConnectionError:
             # Connection dropped mid-request — reconnect and retry once
             log.warning("Connection lost during request, reconnecting and retrying...")
             await self.reconnect()
-            await self._send_dict(root_dict)
-            response = await self._receive()
+            response = await self._roundtrip(root_dict)
         return self._clean_response_dict(response, xpath) or {}
 
     async def _send_request(
@@ -355,15 +380,13 @@ class IAlarm:
             command["Offset"] = f"S32,0,0|{offset}"
         root_dict: dict[str, Any] = self._create_root_dict(xpath, command)
         try:
-            await self._send_dict(root_dict)
-            response: dict[str, Any] = await self._receive()
+            response: dict[str, Any] = await self._roundtrip(root_dict)
         except ConnectionError:
             log.warning(
                 "Connection lost during list request, reconnecting and retrying..."
             )
             await self.reconnect()
-            await self._send_dict(root_dict)
-            response = await self._receive()
+            response = await self._roundtrip(root_dict)
 
         if partial_list is None:
             partial_list = []
