@@ -509,8 +509,14 @@ class IAlarm:
         )
 
     async def get_status(
-        self, extra_info_zone_status: list[ZoneStatusType]
+        self, extra_info_zone_status: list[ZoneStatusType] | None = None
     ) -> AlarmStatusType:
+        """Return the panel status.
+
+        When ``extra_info_zone_status`` (from :meth:`get_zone_status`) is given
+        and the panel is armed, a zone with the alarm flag set is reported as
+        ``TRIGGERED`` together with the alarmed zones.
+        """
         command: OrderedDict[str, Any | None] = OrderedDict()
         command["DevStatus"] = None
         command["Err"] = None

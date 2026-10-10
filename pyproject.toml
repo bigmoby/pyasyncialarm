@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name        = "pyasyncialarm"
-version     = "3.0.2"
+version     = "3.1.0"
 license     = "Apache-2.0"
 license-files = ["LICENSE"]
 description = "A simple library to interface with iAlarm systems, built for use with Home-Assistant"
@@ -35,6 +35,9 @@ packages = ["pyasyncialarm"]
 platforms = ["any"]
 zip-safe  = false
 include-package-data = true
+
+[tool.setuptools.package-data]
+pyasyncialarm = ["py.typed"]
 
 [tool.pylint.MAIN]
 py-version = "3.14"
