@@ -7,6 +7,7 @@ import xml.parsers.expat
 
 import pytest
 
+import pyasyncialarm
 from pyasyncialarm.const import StatusType
 from pyasyncialarm.exception import IAlarmConnectionError
 from pyasyncialarm.pyasyncialarm import IAlarm
@@ -1527,3 +1528,24 @@ async def test_request_retried_after_send_failure(ialarm):
 
     mock_reconnect.assert_awaited_once()
     assert mock_loop.return_value.sock_sendall.await_count == 2
+
+
+def test_public_exports():
+    """Test the main classes are importable from the package root."""
+    assert pyasyncialarm.IAlarm is IAlarm
+    assert pyasyncialarm.IAlarmConnectionError is IAlarmConnectionError
+    assert set(pyasyncialarm.__all__) == {"IAlarm", "IAlarmConnectionError"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dev_status",
+    [IAlarm.ARMED_AWAY, IAlarm.ARMED_STAY, IAlarm.DISARMED, IAlarm.TRIGGERED],
+)
+async def test_get_status_without_zone_status(ialarm, dev_status):
+    """Test get_status can be called without zone information."""
+    ialarm._send_request = AsyncMock(return_value={"DevStatus": dev_status})
+
+    result = await ialarm.get_status()
+
+    assert result == {"status_value": dev_status, "alarmed_zones": []}
